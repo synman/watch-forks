@@ -5,20 +5,19 @@ Polls the same ps surfaces as ~/bin/watch-forks (via importlib reuse), shows
 the top fork count + total CPU in the menu bar, and renders the top-N
 offenders in a custom-view popover dropdown.
 
-Architecture (Phase 2):
+Architecture (Phase 4):
     NSStatusItem (from rumps) → NSStatusBarButton click → togglePopover_
     NSPopover (transient) → NSViewController → custom NSStackView layout
-        header (NSTextField)     ← _create_header_view / _update_header_view
+        header (HeaderOverviewView)  ← _create_header_view / _update_header_view
+            SparklinePanelView × 3 (CPU · PROCS · RATE)
         separator (NSBox)
         scroll view → row stack  ← _create_row_view / _update_row_view (×N)
         separator (NSBox)
         footer row (Settings ▾, Refresh, Open in Terminal, Quit)
 
-The two _create_*_view / _update_*_view override points are the *whole reason*
-this phase exists. Phase 3 will replace _create_row_view with a custom NSView
-(icon + name + sparkline + gauge + CPU); Phase 4 will replace _create_header_view
-with a multi-sparkline overview. Today both return plain NSTextField views
-rendering today's text exactly — visual parity with the NSMenu version.
+Phase 4 replaced the placeholder NSTextField header with HeaderOverviewView —
+a three-panel sparkline overview (total CPU, total processes, fork rate). Each
+panel is a SparklinePanelView that draws its own NSBezierPath sparkline.
 
 Persisted settings: interval, top N, sort by are stored in
   ~/Library/Application Support/watch-forks-menubar/settings.json
@@ -69,9 +68,13 @@ from AppKit import (
     NSFont,
     NSFontAttributeName,
     NSFontWeightMedium,
+    NSFontWeightSemibold,
+    NSForegroundColorAttributeName,
+    NSGraphicsContext,
     NSImage,
-    NSImageView,
     NSImageScaleProportionallyDown,
+    NSImageSymbolConfiguration,
+    NSImageView,
     NSLayoutAttributeBottom,
     NSLayoutAttributeLeading,
     NSLayoutAttributeCenterY,
@@ -83,6 +86,7 @@ from AppKit import (
     NSScrollView,
     NSStackView,
     NSStackViewDistributionFill,
+    NSStackViewDistributionFillEqually,
     NSStackViewGravityCenter,
     NSStackViewGravityLeading,
     NSStackViewGravityTop,
@@ -967,6 +971,333 @@ class _TickHandler(NSObject):
 
 
 # ===========================================================================
+# Phase 4 — Header sparkline views
+# ===========================================================================
+#
+# HeaderOverviewView is a plain NSView container that holds three
+# SparklinePanelView instances in a horizontal NSStackView. Each panel
+# shows a title caption, a large current-value label, a severity glyph,
+# and a NSBezierPath sparkline for the last 30 s of data.
+#
+# SparklinePanelView subclasses NSView and overrides drawRect_ to paint
+# the sparkline using NSBezierPath (anti-aliased, 1.5pt stroke, 20%-alpha
+# fill under the curve). The big-number label, caption, and glyph are
+# NSTextField / NSImageView subviews so Auto Layout handles positioning;
+# only the sparkline itself is custom-drawn.
+
+# Severity → NSColor mapping used by both the trend arrow and the
+# sparkline stroke.
+def _severity_color(severity: str) -> "NSColor":
+    if severity == "hot":
+        return NSColor.systemRedColor()
+    if severity == "warm":
+        return NSColor.systemOrangeColor()
+    return NSColor.systemBlueColor()
+
+
+def _trend_color(cpu_trend: str) -> "NSColor":
+    if cpu_trend == "rising":
+        return NSColor.systemRedColor()
+    if cpu_trend == "falling":
+        return NSColor.systemBlueColor()
+    return NSColor.secondaryLabelColor()
+
+
+def _severity_symbol(severity: str) -> str:
+    """SF Symbol name for the current severity state."""
+    if severity == "hot":
+        return "flame.fill"
+    if severity == "warm":
+        return "thermometer.medium"
+    return "snowflake"
+
+
+def _make_label(text: str, font: "NSFont", color: "NSColor" = None) -> "NSTextField":
+    tf = NSTextField.alloc().init()
+    tf.setBezeled_(False)
+    tf.setDrawsBackground_(False)
+    tf.setEditable_(False)
+    tf.setSelectable_(False)
+    tf.setFont_(font)
+    tf.setStringValue_(text)
+    if color is not None:
+        tf.setTextColor_(color)
+    tf.setTranslatesAutoresizingMaskIntoConstraints_(False)
+    return tf
+
+
+class SparklinePanelView(NSView):
+    """A single sparkline panel: caption + big value + glyph + sparkline.
+
+    Layout (top → bottom):
+      • caption label (10pt, secondaryLabelColor)      ~14pt tall
+      • value row: big label (22pt semibold) + glyph    ~30pt tall
+      • sparkline                                        ~36pt tall
+
+    Total panel height: ~80pt. Width: fills equally inside HeaderOverviewView.
+
+    Data is pushed via _update() — called on every tick from
+    _update_header_view, never triggers a re-layout (just redraws).
+    """
+
+    def initWithFrame_(self, frame):  # noqa: N802
+        self = objc.super(SparklinePanelView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._history: list[float] = []        # the values to plot
+        self._stroke_color = NSColor.systemBlueColor()
+        self._setup_subviews()
+        return self
+
+    def _setup_subviews(self):
+        _caption_font = NSFont.systemFontOfSize_weight_(10.0, 0)
+        _value_font = NSFont.systemFontOfSize_weight_(22.0, NSFontWeightSemibold)
+
+        self._caption_label = _make_label(
+            "", _caption_font, NSColor.secondaryLabelColor()
+        )
+        self._value_label = _make_label(
+            "—", _value_font
+        )
+        self._glyph_view = NSImageView.alloc().init()
+        self._glyph_view.setTranslatesAutoresizingMaskIntoConstraints_(False)
+
+        # Row stack: value label + glyph side by side
+        value_row = NSStackView.alloc().init()
+        value_row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+        value_row.setSpacing_(4.0)
+        value_row.setDistribution_(NSStackViewDistributionFill)
+        value_row.setAlignment_(NSLayoutAttributeBottom)
+        value_row.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        value_row.addView_inGravity_(self._value_label, NSStackViewGravityLeading)
+        value_row.addView_inGravity_(self._glyph_view, NSStackViewGravityLeading)
+
+        # Outer vertical stack: caption → value_row (sparkline drawn in drawRect_)
+        outer = NSStackView.alloc().init()
+        outer.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
+        outer.setSpacing_(2.0)
+        outer.setDistribution_(NSStackViewDistributionFill)
+        outer.setAlignment_(NSLayoutAttributeLeading)
+        outer.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        outer.addView_inGravity_(self._caption_label, NSStackViewGravityTop)
+        outer.addView_inGravity_(value_row, NSStackViewGravityTop)
+
+        self.addSubview_(outer)
+
+        # Pin outer stack to top/leading/trailing, leave bottom ~36pt for sparkline
+        outer.topAnchor().constraintEqualToAnchor_constant_(self.topAnchor(), 6.0).setActive_(True)
+        outer.leadingAnchor().constraintEqualToAnchor_constant_(self.leadingAnchor(), 8.0).setActive_(True)
+        outer.trailingAnchor().constraintEqualToAnchor_constant_(self.trailingAnchor(), -8.0).setActive_(True)
+
+        # Glyph size: 18×18pt
+        self._glyph_view.widthAnchor().constraintEqualToConstant_(18.0).setActive_(True)
+        self._glyph_view.heightAnchor().constraintEqualToConstant_(18.0).setActive_(True)
+
+    def _update(
+        self,
+        caption: str,
+        value_text: str,
+        history: list,
+        stroke_color: "NSColor",
+        symbol_name: str = None,
+        symbol_color: "NSColor" = None,
+    ) -> None:
+        """Push new data into the panel and schedule a redraw."""
+        self._caption_label.setStringValue_(caption)
+        self._value_label.setStringValue_(value_text)
+        self._history = list(history)
+        self._stroke_color = stroke_color
+
+        # SF Symbol glyph
+        if symbol_name:
+            try:
+                cfg = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(
+                    symbol_color or stroke_color
+                )
+                img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    symbol_name, None
+                )
+                if img is not None:
+                    img = img.imageWithSymbolConfiguration_(cfg)
+                    self._glyph_view.setImage_(img)
+            except Exception:
+                pass
+        else:
+            self._glyph_view.setImage_(None)
+
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, rect):  # noqa: N802
+        """Draw the sparkline in the bottom ~36pt of the panel."""
+        objc.super(SparklinePanelView, self).drawRect_(rect)
+
+        bounds = self.bounds()
+        panel_w = bounds.size.width
+        panel_h = bounds.size.height
+
+        # Sparkline occupies the bottom 36pt of the panel
+        sparkline_h = 36.0
+        sparkline_y = 4.0
+        sparkline_x = 8.0
+        sparkline_w = panel_w - 16.0
+
+        history = self._history
+        n = len(history)
+        if n < 2 or sparkline_w <= 0:
+            return
+
+        min_val = min(history)
+        max_val = max(history)
+        val_range = max_val - min_val
+        if val_range < 1e-6:
+            val_range = 1.0  # flat line — draw at midpoint
+
+        def _x(i):
+            return sparkline_x + (i / (n - 1)) * sparkline_w
+
+        def _y(v):
+            norm = (v - min_val) / val_range
+            # Clamp to [0.05, 0.95] so the line doesn't touch the edges
+            norm = max(0.05, min(0.95, norm))
+            return sparkline_y + norm * sparkline_h
+
+        # Build the path
+        path = NSBezierPath.bezierPath()
+        path.setLineWidth_(1.5)
+        path.moveToPoint_((NSPoint(_x(0), _y(history[0]))))
+        for i in range(1, n):
+            path.lineToPoint_((NSPoint(_x(i), _y(history[i]))))
+
+        # Fill area under the curve at 20% alpha
+        fill_path = NSBezierPath.bezierPath()
+        fill_path.moveToPoint_((NSPoint(_x(0), sparkline_y)))
+        fill_path.lineToPoint_((NSPoint(_x(0), _y(history[0]))))
+        for i in range(1, n):
+            fill_path.lineToPoint_((NSPoint(_x(i), _y(history[i]))))
+        fill_path.lineToPoint_((NSPoint(_x(n - 1), sparkline_y)))
+        fill_path.closePath()
+
+        fill_color = self._stroke_color.colorWithAlphaComponent_(0.18)
+        fill_color.setFill()
+        fill_path.fill()
+
+        # Stroke
+        self._stroke_color.setStroke()
+        NSGraphicsContext.currentContext().setShouldAntialias_(True)
+        path.stroke()
+
+
+class HeaderOverviewView(NSView):
+    """Three-panel sparkline header: CPU · PROCS · RATE.
+
+    Constructed once by _create_header_view; mutated in place by
+    _update_header_view on every tick. Width matches the popover
+    (~460pt); height is fixed at 92pt.
+    """
+
+    HEADER_HEIGHT = 92.0
+
+    def initWithFrame_(self, frame):  # noqa: N802
+        self = objc.super(HeaderOverviewView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._setup_panels()
+        return self
+
+    def _setup_panels(self):
+        self._cpu_panel = SparklinePanelView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, 140, self.HEADER_HEIGHT)
+        )
+        self._procs_panel = SparklinePanelView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, 140, self.HEADER_HEIGHT)
+        )
+        self._rate_panel = SparklinePanelView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, 140, self.HEADER_HEIGHT)
+        )
+
+        hstack = NSStackView.alloc().init()
+        hstack.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+        hstack.setDistribution_(NSStackViewDistributionFillEqually)
+        hstack.setSpacing_(0.0)
+        hstack.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        hstack.addView_inGravity_(self._cpu_panel, NSStackViewGravityLeading)
+        hstack.addView_inGravity_(self._procs_panel, NSStackViewGravityLeading)
+        hstack.addView_inGravity_(self._rate_panel, NSStackViewGravityLeading)
+
+        self.addSubview_(hstack)
+        hstack.topAnchor().constraintEqualToAnchor_(self.topAnchor()).setActive_(True)
+        hstack.leadingAnchor().constraintEqualToAnchor_(self.leadingAnchor()).setActive_(True)
+        hstack.trailingAnchor().constraintEqualToAnchor_(self.trailingAnchor()).setActive_(True)
+        hstack.bottomAnchor().constraintEqualToAnchor_(self.bottomAnchor()).setActive_(True)
+
+    def update_data(self, global_state: dict) -> None:
+        """Push fresh tick data into the three sparkline panels."""
+        cpu_history = global_state.get("cpu_history", [])
+        proc_history = global_state.get("proc_history", [])
+        severity = global_state.get("severity", "cold")
+        cpu_trend = global_state.get("cpu_trend", "steady")
+        total_cpu = global_state.get("total_cpu", 0.0)
+        total_procs = global_state.get("total_procs", 0)
+        rate = global_state.get("rate", 0.0)
+
+        sev_color = _severity_color(severity)
+        trend_color = _trend_color(cpu_trend)
+        trend_arrow = TREND_BY_STATE.get(cpu_trend, "→")
+
+        # --- CPU panel ---
+        cpu_vals = [v for _, v in cpu_history] if cpu_history else [total_cpu]
+        self._cpu_panel._update(
+            caption="CPU",
+            value_text=f"{total_cpu:.0f}% {trend_arrow}",
+            history=cpu_vals,
+            stroke_color=trend_color,
+            symbol_name=None,
+        )
+        # Tint the value label with the trend color
+        self._cpu_panel._value_label.setTextColor_(trend_color)
+
+        # --- PROCS panel ---
+        proc_vals = [float(v) for _, v in proc_history] if proc_history else [float(total_procs)]
+        self._procs_panel._update(
+            caption="PROCS",
+            value_text=str(total_procs),
+            history=proc_vals,
+            stroke_color=sev_color,
+            symbol_name=_severity_symbol(severity),
+            symbol_color=sev_color,
+        )
+        self._procs_panel._value_label.setTextColor_(NSColor.labelColor())
+
+        # --- RATE panel ---
+        # Derive per-sample rate from proc_history (differential of adjacent points)
+        rate_vals: list[float] = []
+        if len(proc_history) >= 2:
+            pts = list(proc_history)
+            # Take up to the last 16 points
+            pts = pts[-16:]
+            for j in range(1, len(pts)):
+                t0, n0 = pts[j - 1]
+                t1, n1 = pts[j]
+                dt = t1 - t0
+                rate_vals.append((n1 - n0) / dt if dt > 0 else 0.0)
+        if not rate_vals:
+            rate_vals = [rate]
+
+        rate_color = _severity_color(severity)
+        self._rate_panel._update(
+            caption="RATE",
+            value_text=f"{rate:+.1f}/s",
+            history=rate_vals,
+            stroke_color=rate_color,
+            symbol_name=None,
+        )
+        rate_label_color = NSColor.systemRedColor() if rate > 0 else (
+            NSColor.systemBlueColor() if rate < 0 else NSColor.secondaryLabelColor()
+        )
+        self._rate_panel._value_label.setTextColor_(rate_label_color)
+
+
+# ===========================================================================
 # Popover view controller
 # ===========================================================================
 #
@@ -976,14 +1307,14 @@ class _TickHandler(NSObject):
 #
 #   _create_row_view(row_data, bar_context) → NSView
 #   _update_row_view(view, row_data, bar_context) → None
-#   _create_header_view(launchd_data) → NSView
-#   _update_header_view(view, launchd_data) → None
+#   _create_header_view(launchd_data, global_state) → NSView
+#   _update_header_view(view, launchd_data, global_state) → None
 #
-# Phase 2 returns plain NSTextField views from the create methods and
-# rewrites stringValue on update. Phase 3 will subclass these to return
-# rich composite views (icon + name + sparkline + gauge + CPU); Phase 4
-# will swap the header for a multi-sparkline overview. The data plumbing
-# stays the same — only the view construction/update logic changes.
+# Phase 4 swapped _create_header_view / _update_header_view to return /
+# mutate a HeaderOverviewView (three SparklinePanelView panels: CPU, PROCS,
+# RATE). Phase 3 will replace _create_row_view with a rich composite view.
+# The data plumbing stays the same — only the view construction/update logic
+# changes.
 
 class WatchForksViewController(NSViewController):
     """NSViewController that owns the popover's view hierarchy.
@@ -1024,10 +1355,15 @@ class WatchForksViewController(NSViewController):
         root.setDistribution_(NSStackViewDistributionFill)
         root.setTranslatesAutoresizingMaskIntoConstraints_(False)
 
-        # Header — placeholder view; Phase 4 will replace this with a
-        # multi-sparkline overview view.
-        header = self._app._create_header_view(self._initial_header_data())
+        # Header — Phase 4 multi-sparkline overview view.
+        header = self._app._create_header_view(
+            self._initial_header_data(), self._initial_global_state()
+        )
         self._header_view = header
+        # Fix the header height so the popover doesn't collapse it.
+        header.heightAnchor().constraintEqualToConstant_(
+            HeaderOverviewView.HEADER_HEIGHT
+        ).setActive_(True)
         root.addView_inGravity_(header, NSStackViewGravityTop)
 
         # Separator
@@ -1089,6 +1425,21 @@ class WatchForksViewController(NSViewController):
         _tick() may not have run yet, so we hand back a placeholder
         that _create_header_view can render as an em-dash banner."""
         return None  # _create_header_view handles None as "no data yet"
+
+    def _initial_global_state(self) -> dict:
+        """Minimal global_state dict for header construction before any tick
+        has run. All values are neutral defaults — the header panels will show
+        '—' / 0 until the first tick populates real data."""
+        app = self._app
+        return {
+            "severity": getattr(app, "severity", "cold"),
+            "rate": getattr(app, "rate", 0.0),
+            "cpu_trend": getattr(app, "cpu_trend", "steady"),
+            "proc_history": list(getattr(app, "proc_history", [])),
+            "cpu_history": list(getattr(app, "cpu_history", [])),
+            "total_cpu": 0.0,
+            "total_procs": 0,
+        }
 
     # ----- footer construction -----
 
@@ -1418,6 +1769,8 @@ class WatchForksApp(rumps.App):
         self.severity: str = "cold"
         self.rate: float = 0.0
         self.proc_history: deque[tuple[float, int]] = deque()
+        # Phase 4: rolling CPU history for the header sparkline.
+        self.cpu_history: deque[tuple[float, float]] = deque()
         # Per-PID rate state, same machine. Pruned each tick to whatever
         # PIDs are alive in the current snapshot.
         self.pid_history: dict[int, deque[tuple[float, int]]] = {}
@@ -1700,38 +2053,31 @@ class WatchForksApp(rumps.App):
             if isinstance(view, _PlaceholderRowView):
                 view.setRowApp_pid_name_(self, pid, name)
 
-    def _create_header_view(self, launchd_data):
-        """Construct the header view from a launchd snapshot tuple.
+    def _create_header_view(self, launchd_data, global_state):
+        """Construct the header view.
 
-        Phase 2: return a monospaced NSTextField. Phase 4 will replace
-        this with a multi-sparkline overview (total procs, total CPU,
-        fork rate)."""
-        view = _mono_text_field("…")
-        if launchd_data is not None:
-            self._update_header_view(view, launchd_data)
+        Phase 4: return a HeaderOverviewView with three sparkline panels
+        (CPU · PROCS · RATE). launchd_data and global_state may be None /
+        empty at construction time — the view renders neutral defaults
+        until the first real tick populates it."""
+        view = HeaderOverviewView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, POPOVER_WIDTH, HeaderOverviewView.HEADER_HEIGHT)
+        )
+        view.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        if global_state:
+            view.update_data(global_state)
         return view
 
-    def _update_header_view(self, view, launchd_data):
+    def _update_header_view(self, view, launchd_data, global_state):
         """Mutate the header view to reflect new data.
 
-        Phase 2: rewrite the NSTextField's stringValue. Phase 4 will
-        update sparkline buffers instead.
-
-        launchd_data is the full PID-1 row tuple OR None (no PID 1 in
-        snapshot — fall back to a degraded message). The total_procs
-        fallback is read off self for the degraded case so the header
-        never says "n/a" when we know the procs count."""
-        if launchd_data is None:
-            view.setStringValue_(
-                f"launchd · n/a (procs={len(self._last_snapshot)})"
-            )
-            return
-        forks_n, threads_n, pid, _, _, _, acc_cpu = launchd_data
-        pid1_emoji = SEV_BY_STATE[self.pid_severity.get(1, "cold")]
-        view.setStringValue_(
-            f"{pid1_emoji} launchd · {forks_n} forks · "
-            f"{threads_n} threads · {acc_cpu:.1f}% CPU"
-        )
+        Phase 4: push fresh global_state into the HeaderOverviewView so
+        its three sparkline panels redraw. launchd_data is accepted for
+        API compatibility but the sparkline panels use totals from
+        global_state rather than the PID-1 row directly.
+        """
+        if isinstance(view, HeaderOverviewView) and global_state:
+            view.update_data(global_state)
 
     # ============================================================================
     # END OVERRIDE POINTS
@@ -1754,14 +2100,21 @@ class WatchForksApp(rumps.App):
         self._update_global_severity(total_procs, now)
         self._update_pid_severity(snap, now)
 
+        # Phase 4: track total CPU history for the header sparkline.
+        # total_cpu is computed below; we need a forward reference, so we
+        # compute it here and reuse the value in the title block.
+        total_cpu = sum(parse_pcpu(pcpu) for _, _, _, pcpu, _, _, _ in snap)
+
+        # cpu_history: trim the window and append the fresh sample.
+        self._trim(self.cpu_history, now)
+        self.cpu_history.append((now, total_cpu))
+
         # Title — emoji · total procs · summed CPU% · trend.
         # Σ pcpu over every row = system-wide CPU%. By construction
         # this equals the root's subtree-accumulated value (launchd
         # is ancestor of every user process), so the top row in the
         # popover carries the same number as the menubar title.
-        total_cpu = 0.0
-        for _, _, _, pcpu, _, _, _ in snap:
-            total_cpu += parse_pcpu(pcpu)
+        # (total_cpu already computed above for cpu_history tracking.)
         emoji = SEV_BY_STATE[self.severity]
         # CPU trend — sample-to-sample delta with asymmetric hysteresis.
         # First tick has no prior sample → seed steady and skip the
@@ -1788,12 +2141,18 @@ class WatchForksApp(rumps.App):
         if self._vc is None:
             return
 
-        # Header — PID 1 (launchd) details. launchd is the ancestor of every
-        # user process on macOS, so its acc_cpu == total system CPU and its
-        # forks count is the per-uid direct-child population. Defensive
-        # fallback when ps omits PID 1.
+        # Header — PID 1 (launchd) details plus global state for sparklines.
         pid1 = next((r for r in snap if r[2] == 1), None)
-        self._update_header_view(self._vc._header_view, pid1)
+        global_state = {
+            "severity": self.severity,
+            "rate": self.rate,
+            "cpu_trend": self.cpu_trend,
+            "proc_history": list(self.proc_history),
+            "cpu_history": list(self.cpu_history),
+            "total_cpu": total_cpu,
+            "total_procs": total_procs,
+        }
+        self._update_header_view(self._vc._header_view, pid1, global_state)
 
         # Rows — mutate the view pool in place; resize the pool to match
         # the active top-N, then update each visible row.
