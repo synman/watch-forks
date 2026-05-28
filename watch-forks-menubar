@@ -848,7 +848,7 @@ class RichRowView(NSView):
     def setApp_(self, app):  # noqa: N802
         self._app = app
 
-    def update_(self, row_data, bar_context, pid_history, pid_severity):  # noqa: N802
+    def apply_update(self, row_data, bar_context, pid_history, pid_severity):
         """Mutate all subviews to reflect new row data.
 
         row_data   — 7-tuple (forks_n, threads_n, pid, pcpu, stat, name, acc_cpu)
@@ -1150,7 +1150,7 @@ class SparklinePanelView(NSView):
         self._glyph_view.widthAnchor().constraintEqualToConstant_(18.0).setActive_(True)
         self._glyph_view.heightAnchor().constraintEqualToConstant_(18.0).setActive_(True)
 
-    def _update(
+    def apply_update(
         self,
         caption: str,
         value_text: str,
@@ -1303,7 +1303,7 @@ class HeaderOverviewView(NSView):
 
         # --- CPU panel ---
         cpu_vals = [v for _, v in cpu_history] if cpu_history else [total_cpu]
-        self._cpu_panel._update(
+        self._cpu_panel.apply_update(
             caption="CPU",
             value_text=f"{total_cpu:.0f}% {trend_arrow}",
             history=cpu_vals,
@@ -1315,7 +1315,7 @@ class HeaderOverviewView(NSView):
 
         # --- PROCS panel ---
         proc_vals = [float(v) for _, v in proc_history] if proc_history else [float(total_procs)]
-        self._procs_panel._update(
+        self._procs_panel.apply_update(
             caption="PROCS",
             value_text=str(total_procs),
             history=proc_vals,
@@ -1341,7 +1341,7 @@ class HeaderOverviewView(NSView):
             rate_vals = [rate]
 
         rate_color = _severity_color(severity)
-        self._rate_panel._update(
+        self._rate_panel.apply_update(
             caption="RATE",
             value_text=f"{rate:+.1f}/s",
             history=rate_vals,
@@ -2142,11 +2142,11 @@ class WatchForksApp(rumps.App):
     def _update_row_view(self, view, row_data, bar_context):
         """Mutate the row view's display to reflect new data.
 
-        Phase 3: delegates to RichRowView.update_() which updates all
+        Phase 3: delegates to RichRowView.apply_update() which updates all
         subviews (severity image, process icon, name, sparkline, gauge,
         CPU label) in place — no views are destroyed or recreated."""
         if isinstance(view, RichRowView):
-            view.update_(row_data, bar_context, self.pid_history, self.pid_severity)
+            view.apply_update(row_data, bar_context, self.pid_history, self.pid_severity)
         else:
             # Fallback for any non-RichRowView (shouldn't happen in Phase 3,
             # but keeps the app alive if the view pool is in a mixed state).

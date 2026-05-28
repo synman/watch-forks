@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # Resolve script's own physical directory (symlink-safe)
-SCRIPT_DIR="$(cd "$(dirname "$(pwd -P)/$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$SCRIPT_DIR"
 
 # Bundle paths
@@ -43,7 +43,7 @@ echo "  • Creating MacOS wrapper executable"
 cat > "$MACOS_DIR/watch-forks-menubar" << 'EOF'
 #!/usr/bin/env bash
 # Wrapper to launch watch-forks-menubar from the app bundle
-SCRIPT_DIR="$(cd "$(dirname "$(pwd -P)/$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 exec /usr/bin/env python3 "${SCRIPT_DIR}/../Resources/watch-forks-menubar.py" "$@"
 EOF
 chmod +x "$MACOS_DIR/watch-forks-menubar"
