@@ -3,20 +3,34 @@
 
 Polls the same ps surfaces as ~/bin/watch-forks (via importlib reuse), shows
 the top fork count + total CPU in the menu bar, and renders the top-N
-offenders in the dropdown. Each offender opens a submenu with PID/CPU/STAT
-details plus SIGTERM and SIGKILL actions (with confirm dialog).
+offenders in a custom-view popover dropdown.
 
-Persisted settings: interval, top N, and pause state are stored in
+Architecture (Phase 2):
+    NSStatusItem (from rumps) → NSStatusBarButton click → togglePopover_
+    NSPopover (transient) → NSViewController → custom NSStackView layout
+        header (NSTextField)     ← _create_header_view / _update_header_view
+        separator (NSBox)
+        scroll view → row stack  ← _create_row_view / _update_row_view (×N)
+        separator (NSBox)
+        footer row (Settings ▾, Refresh, Open in Terminal, Quit)
+
+The two _create_*_view / _update_*_view override points are the *whole reason*
+this phase exists. Phase 3 will replace _create_row_view with a custom NSView
+(icon + name + sparkline + gauge + CPU); Phase 4 will replace _create_header_view
+with a multi-sparkline overview. Today both return plain NSTextField views
+rendering today's text exactly — visual parity with the NSMenu version.
+
+Persisted settings: interval, top N, sort by are stored in
   ~/Library/Application Support/watch-forks-menubar/settings.json
 and reloaded at launch.
 
-Live-updates while the dropdown is open: the timer is scheduled in
-NSRunLoopCommonModes (so it fires during NSEventTrackingRunLoopMode menu
-tracking), and a fixed pool of NSMenuItem rows is mutated in place each
-tick — never cleared — so the open menu stays open and just refreshes.
+Live-updates while the popover is open: NSTimer in NSRunLoopCommonModes (same
+pattern as before — strictly speaking NSPopover doesn't suspend the default
+run loop the way NSMenu tracking does, but common modes is harmless and
+consistent with the rest of the AppKit-driver code).
 
 Launch:  ~/bin/watch-forks-menubar &
-Quit:    menu → Quit (or pkill -f watch-forks-menubar)
+Quit:    popover footer → Quit (or pkill -f watch-forks-menubar)
 """
 from __future__ import annotations
 
@@ -33,7 +47,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 if platform.system() != "Darwin":
     sys.stderr.write("watch-forks-menubar: macOS-only\n")
@@ -43,14 +57,39 @@ import objc
 import rumps
 from AppKit import (
     NSAlert,
-    NSAttributedString,
     NSApp,
+    NSAttributedString,
+    NSBezelStyleRounded,
+    NSBox,
+    NSBoxSeparator,
+    NSButton,
     NSFloatingWindowLevel,
     NSFont,
     NSFontAttributeName,
+    NSLayoutAttributeBottom,
+    NSLayoutAttributeLeading,
+    NSMenu,
+    NSMenuItem,
+    NSPopover,
+    NSPopoverBehaviorTransient,
+    NSRectEdgeMinY,
+    NSScrollView,
+    NSStackView,
+    NSStackViewDistributionFill,
+    NSStackViewGravityCenter,
+    NSStackViewGravityLeading,
+    NSStackViewGravityTop,
+    NSStackViewGravityTrailing,
+    NSTextField,
+    NSUserInterfaceLayoutOrientationHorizontal,
+    NSUserInterfaceLayoutOrientationVertical,
+    NSViewController,
 )
 from Foundation import (
+    NSMakeRect,
+    NSMakeSize,
     NSObject,
+    NSPoint,
     NSRunLoop,
     NSRunLoopCommonModes,
     NSTimer,
@@ -125,7 +164,14 @@ SORT_CHOICES = [("forks", "Forks"), ("cpu", "CPU%")]
 DEFAULT_INTERVAL = 5.0
 DEFAULT_TOP = 15
 DEFAULT_SORT = "forks"
-MAX_TOP = max(TOP_CHOICES)  # pool size for the row item array
+MAX_TOP = max(TOP_CHOICES)  # upper bound on row count for the popover
+
+# Popover sizing — these are starting values for the architectural skeleton.
+# Phases 3/5 will likely tune these (the custom row views will be taller than
+# a one-line NSTextField, so the height will need to grow once rows have
+# sparklines/gauges).
+POPOVER_WIDTH = 460.0
+POPOVER_ROW_AREA_HEIGHT = 400.0  # scroll view height cap
 
 
 def interval_label(sec: float) -> str:
@@ -348,17 +394,25 @@ def compute_rate(history: "deque[tuple[float, int]]", current_value: int, now: f
     return (current_value - n0) / dt
 
 
-# Mono font for menu items — see set_mono_title below.
+# Mono font for popover content — gives column alignment on plain
+# NSTextField rows. Phase 3's rich row views won't need this (they'll lay
+# out subviews explicitly), but the Phase 2 placeholder views are pure text.
 _MONO_FONT = NSFont.monospacedSystemFontOfSize_weight_(13.0, 0)
 _MONO_ATTRS = {NSFontAttributeName: _MONO_FONT}
 
 
-def set_mono_title(item: rumps.MenuItem, text: str) -> None:
-    """Render the menu item title in monospaced San Francisco for real
-    column alignment — the regular menu font is proportional, so plain
-    string padding never lines up."""
-    attr = NSAttributedString.alloc().initWithString_attributes_(text, _MONO_ATTRS)
-    item._menuitem.setAttributedTitle_(attr)
+def _mono_text_field(text: str) -> NSTextField:
+    """Construct a label-style NSTextField with monospaced font. Used for
+    both header and row placeholder views — Phase 3/4 will replace these
+    with real composite views that draw their own subcomponents."""
+    tf = NSTextField.alloc().init()
+    tf.setBezeled_(False)
+    tf.setDrawsBackground_(False)
+    tf.setEditable_(False)
+    tf.setSelectable_(False)
+    tf.setFont_(_MONO_FONT)
+    tf.setStringValue_(text)
+    return tf
 
 
 _BAR_FULL = "█"
@@ -373,7 +427,7 @@ _BAR_EMPTY = " "
 def bar(value: int, max_value: int, width: int = 8) -> str:
     """Discrete log-scaled gauge — full block for filled cells, light
     shade for empty cells. Discrete (no partial-height blocks) so the
-    bar renders as a clean rectangle in NSMenu's mono font; partial
+    bar renders as a clean rectangle in the popover's mono font; partial
     blocks like ▁▂▃ sit at the bottom of the cell and read as visual
     artifacts. A non-zero value always lights at least one cell so the
     smallest forkers stay visible."""
@@ -511,6 +565,431 @@ class _TickHandler(NSObject):
             log.exception("tick failed")
 
 
+# ===========================================================================
+# Popover view controller
+# ===========================================================================
+#
+# WatchForksViewController hosts the popover's content. It owns the view
+# hierarchy (header + scrollable rows + footer) and exposes the two
+# create/update override points that Phases 3 and 4 will replace:
+#
+#   _create_row_view(row_data, bar_context) → NSView
+#   _update_row_view(view, row_data, bar_context) → None
+#   _create_header_view(launchd_data) → NSView
+#   _update_header_view(view, launchd_data) → None
+#
+# Phase 2 returns plain NSTextField views from the create methods and
+# rewrites stringValue on update. Phase 3 will subclass these to return
+# rich composite views (icon + name + sparkline + gauge + CPU); Phase 4
+# will swap the header for a multi-sparkline overview. The data plumbing
+# stays the same — only the view construction/update logic changes.
+
+class WatchForksViewController(NSViewController):
+    """NSViewController that owns the popover's view hierarchy.
+
+    Built lazily by loadView() the first time AppKit needs the view — we
+    construct the stack-of-stacks layout once, then mutate text in place
+    on each tick. The row views are kept as a Python list (self._row_views)
+    so the app can call _update_row_view on each slot per tick; rows
+    beyond the current top-N are removed and re-added when top-N changes.
+    """
+
+    # NSViewController.alloc().init() invokes initWithNibName_bundle_(None, None);
+    # we set the back-pointer to the app afterwards via setApp_.
+
+    def setApp_(self, app):  # noqa: N802
+        """Back-pointer so callbacks (footer buttons, row context menus)
+        can reach the app's state and methods. Set immediately after init."""
+        self._app = app
+        self._row_views: list[NSTextField] = []
+        self._header_view = None
+        self._row_stack = None
+        self._scroll_view = None
+        self._settings_menu = None
+
+    # ----- view construction (called once by AppKit) -----
+
+    def loadView(self):  # noqa: N802 — ObjC selector
+        """Build the popover's content view: a vertical NSStackView with
+        header, separator, scrollable row region, separator, footer. The
+        view is sized to POPOVER_WIDTH × (header + rows + footer); the
+        scroll view caps its content at POPOVER_ROW_AREA_HEIGHT."""
+        # Root vertical stack — fills the popover.
+        root = NSStackView.alloc().init()
+        root.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
+        root.setAlignment_(NSLayoutAttributeLeading)
+        root.setSpacing_(6.0)
+        root.setEdgeInsets_((10.0, 10.0, 10.0, 10.0))
+        root.setDistribution_(NSStackViewDistributionFill)
+        root.setTranslatesAutoresizingMaskIntoConstraints_(False)
+
+        # Header — placeholder view; Phase 4 will replace this with a
+        # multi-sparkline overview view.
+        header = self._app._create_header_view(self._initial_header_data())
+        self._header_view = header
+        root.addView_inGravity_(header, NSStackViewGravityTop)
+
+        # Separator
+        sep1 = NSBox.alloc().init()
+        sep1.setBoxType_(NSBoxSeparator)
+        root.addView_inGravity_(sep1, NSStackViewGravityTop)
+
+        # Scrollable rows region — inner stack of row views, wrapped in
+        # an NSScrollView so the popover stays a fixed height even when
+        # top-N grows.
+        row_stack = NSStackView.alloc().init()
+        row_stack.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
+        row_stack.setAlignment_(NSLayoutAttributeLeading)
+        row_stack.setSpacing_(2.0)
+        row_stack.setDistribution_(NSStackViewDistributionFill)
+        row_stack.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        self._row_stack = row_stack
+
+        scroll = NSScrollView.alloc().init()
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+        scroll.setBorderType_(0)  # NSNoBorder
+        scroll.setDrawsBackground_(False)
+        scroll.setDocumentView_(row_stack)
+        scroll.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        # Width: match root width minus root insets; height: capped.
+        from AppKit import NSLayoutConstraint
+        scroll.heightAnchor().constraintEqualToConstant_(
+            POPOVER_ROW_AREA_HEIGHT
+        ).setActive_(True)
+        scroll.widthAnchor().constraintEqualToConstant_(
+            POPOVER_WIDTH - 20.0
+        ).setActive_(True)
+        # Pin the inner stack's width to the scroll view's clip view width
+        # so row views don't get squeezed when the doc view is narrower.
+        row_stack.widthAnchor().constraintEqualToAnchor_(
+            scroll.contentView().widthAnchor()
+        ).setActive_(True)
+        self._scroll_view = scroll
+        root.addView_inGravity_(scroll, NSStackViewGravityTop)
+
+        # Separator
+        sep2 = NSBox.alloc().init()
+        sep2.setBoxType_(NSBoxSeparator)
+        root.addView_inGravity_(sep2, NSStackViewGravityTop)
+
+        # Footer — Settings ▾ (NSMenu popup), Refresh, Open in Terminal, Quit.
+        footer = self._build_footer()
+        root.addView_inGravity_(footer, NSStackViewGravityTop)
+
+        # Width constraint on root so loadView's view has a defined size
+        # before NSPopover queries -contentSize.
+        root.widthAnchor().constraintEqualToConstant_(POPOVER_WIDTH).setActive_(True)
+
+        self.setView_(root)
+
+    def _initial_header_data(self) -> Optional[tuple]:
+        """Header data tuple at initial construction time. The app's
+        _tick() may not have run yet, so we hand back a placeholder
+        that _create_header_view can render as an em-dash banner."""
+        return None  # _create_header_view handles None as "no data yet"
+
+    # ----- footer construction -----
+
+    def _build_footer(self):
+        """Horizontal NSStackView holding the footer controls. Settings
+        is a button that pops up an NSMenu (the rumps-style submenus for
+        Interval / Top N / Sort by / Start at login live there); the
+        other footer slots are plain action buttons."""
+        footer = NSStackView.alloc().init()
+        footer.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+        footer.setSpacing_(8.0)
+        footer.setDistribution_(NSStackViewDistributionFill)
+        footer.setAlignment_(NSLayoutAttributeBottom)
+
+        settings_btn = NSButton.alloc().init()
+        settings_btn.setTitle_("Settings ▾")
+        settings_btn.setBezelStyle_(NSBezelStyleRounded)
+        settings_btn.setTarget_(self)
+        settings_btn.setAction_(b"showSettings:")
+        footer.addView_inGravity_(settings_btn, NSStackViewGravityLeading)
+
+        refresh_btn = NSButton.alloc().init()
+        refresh_btn.setTitle_("Refresh")
+        refresh_btn.setBezelStyle_(NSBezelStyleRounded)
+        refresh_btn.setTarget_(self)
+        refresh_btn.setAction_(b"refreshNow:")
+        footer.addView_inGravity_(refresh_btn, NSStackViewGravityLeading)
+
+        terminal_btn = NSButton.alloc().init()
+        terminal_btn.setTitle_("Open in Terminal…")
+        terminal_btn.setBezelStyle_(NSBezelStyleRounded)
+        terminal_btn.setTarget_(self)
+        terminal_btn.setAction_(b"openTerminal:")
+        footer.addView_inGravity_(terminal_btn, NSStackViewGravityLeading)
+
+        # Spacer — pushes Quit to the right.
+        spacer = NSStackView.alloc().init()
+        footer.addView_inGravity_(spacer, NSStackViewGravityCenter)
+
+        quit_btn = NSButton.alloc().init()
+        quit_btn.setTitle_("Quit")
+        quit_btn.setBezelStyle_(NSBezelStyleRounded)
+        quit_btn.setTarget_(self)
+        quit_btn.setAction_(b"quitApp:")
+        footer.addView_inGravity_(quit_btn, NSStackViewGravityTrailing)
+
+        return footer
+
+    # ----- footer button actions (ObjC selectors) -----
+
+    def showSettings_(self, sender):  # noqa: N802
+        """Pop up the settings NSMenu under the Settings button.
+
+        We rebuild the menu on each click so the radio-dot state and
+        Start-at-login title reflect current values without bookkeeping
+        across ticks — the cost is ~1 ms per click, negligible."""
+        menu = self._build_settings_menu()
+        # Position the menu so its top-left corner anchors at the
+        # button's bottom-left — feels like a native popup button.
+        loc = NSPoint(0.0, sender.bounds().size.height + 2.0)
+        menu.popUpMenuPositioningItem_atLocation_inView_(None, loc, sender)
+
+    def refreshNow_(self, _sender):  # noqa: N802
+        self._app._refresh_now(None)
+
+    def openTerminal_(self, _sender):  # noqa: N802
+        self._app._open_terminal(None)
+
+    def quitApp_(self, _sender):  # noqa: N802
+        rumps.quit_application()
+
+    # ----- settings menu (rebuilt per click) -----
+
+    def _build_settings_menu(self) -> NSMenu:
+        """Rebuild the settings NSMenu — Interval / Top N / Sort by
+        submenus, Start at login toggle. Radio state is set from the
+        app's current settings so the operator sees the live values."""
+        app = self._app
+        menu = NSMenu.alloc().init()
+        menu.setAutoenablesItems_(False)
+
+        # Interval submenu
+        interval_menu = NSMenu.alloc().init()
+        interval_menu.setAutoenablesItems_(False)
+        for sec in INTERVAL_CHOICES:
+            label = interval_label(sec)
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, b"settingsInterval:", ""
+            )
+            it.setTarget_(self)
+            it.setRepresentedObject_(sec)
+            it.setState_(1 if sec == app.interval else 0)
+            interval_menu.addItem_(it)
+        interval_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Interval", None, ""
+        )
+        interval_root.setSubmenu_(interval_menu)
+        menu.addItem_(interval_root)
+
+        # Top N submenu
+        top_menu = NSMenu.alloc().init()
+        top_menu.setAutoenablesItems_(False)
+        for n in TOP_CHOICES:
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{n}", b"settingsTop:", ""
+            )
+            it.setTarget_(self)
+            it.setRepresentedObject_(n)
+            it.setState_(1 if n == app.top else 0)
+            top_menu.addItem_(it)
+        top_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Top N", None, ""
+        )
+        top_root.setSubmenu_(top_menu)
+        menu.addItem_(top_root)
+
+        # Sort by submenu
+        sort_menu = NSMenu.alloc().init()
+        sort_menu.setAutoenablesItems_(False)
+        for key, label in SORT_CHOICES:
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, b"settingsSort:", ""
+            )
+            it.setTarget_(self)
+            it.setRepresentedObject_(key)
+            it.setState_(1 if key == app.sort_by else 0)
+            sort_menu.addItem_(it)
+        sort_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Sort by", None, ""
+        )
+        sort_root.setSubmenu_(sort_menu)
+        menu.addItem_(sort_root)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Start-at-login toggle — title flips on each invocation.
+        login_title = (
+            "Disable start at login" if is_login_enabled() else "Start at login"
+        )
+        login_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            login_title, b"settingsToggleLogin:", ""
+        )
+        login_item.setTarget_(self)
+        menu.addItem_(login_item)
+
+        return menu
+
+    # ----- settings menu actions -----
+
+    def settingsInterval_(self, sender):  # noqa: N802
+        sec = sender.representedObject()
+        self._app._apply_interval(float(sec))
+
+    def settingsTop_(self, sender):  # noqa: N802
+        n = sender.representedObject()
+        self._app._apply_top(int(n))
+
+    def settingsSort_(self, sender):  # noqa: N802
+        key = sender.representedObject()
+        self._app._apply_sort(str(key))
+
+    def settingsToggleLogin_(self, _sender):  # noqa: N802
+        self._app._toggle_login(None)
+
+    # ----- row stack management (called by app on every tick) -----
+
+    def syncRowCount_(self, n):  # noqa: N802
+        """Grow or shrink self._row_views (and the NSStackView) so it
+        holds exactly `n` row views. Existing views are reused — only
+        the deltas at the tail are added/removed. Called by the app's
+        _tick before per-row updates so the stack matches top-N."""
+        current = len(self._row_views)
+        if n > current:
+            for _ in range(n - current):
+                # Build a fresh row view with no data — the app will
+                # populate it via _update_row_view immediately after.
+                view = self._app._create_row_view(None, None)
+                self._row_views.append(view)
+                self._row_stack.addView_inGravity_(view, NSStackViewGravityTop)
+        elif n < current:
+            for view in self._row_views[n:]:
+                self._row_stack.removeView_(view)
+            del self._row_views[n:]
+
+
+# ===========================================================================
+# Row context menu — right-click actions
+# ===========================================================================
+#
+# Per-row actions used to live in NSMenu submenus (Copy PID / Show in Activity
+# Monitor / Send SIGTERM / Send SIGKILL). In the popover world these become a
+# context menu summoned by right-clicking the row view. To attach a context
+# menu to an NSView we need to subclass it and override -menuForEvent: — wrap
+# a row view in a "RowContainerView" that holds the per-row PID/name and
+# returns the freshly-built menu on demand.
+#
+# Phase 2 placeholder row view IS a plain NSTextField, not a container — to
+# keep the architecture clean for Phase 3 (where the rich row view itself
+# will be the container), we make the row view itself responsible for its
+# context menu. _PlaceholderRowView is a thin NSTextField subclass that
+# carries (pid, name, app_ref) and builds the menu on right-click.
+
+
+class _PlaceholderRowView(NSTextField):
+    """NSTextField row view with right-click context menu. Carries the
+    per-row identity so menu actions know which PID to target.
+
+    Phase 3 will replace this with a richer NSView subclass; the
+    menuForEvent_ contract carries over verbatim — same per-row identity,
+    same menu building, only the rendering changes.
+    """
+
+    def initFrame_(self, frame):  # noqa: N802
+        self = objc.super(_PlaceholderRowView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._pid: Optional[int] = None
+        self._name: str = ""
+        self._app = None
+        return self
+
+    def setRowApp_pid_name_(self, app, pid, name):  # noqa: N802
+        self._app = app
+        self._pid = pid
+        self._name = name
+
+    def menuForEvent_(self, _event):  # noqa: N802
+        if self._app is None or self._pid is None:
+            return None
+        return self._app._build_row_context_menu(self._pid, self._name)
+
+
+# ===========================================================================
+# Row / header action delegate
+# ===========================================================================
+#
+# NSMenuItem actions need an ObjC target. We could route them straight to the
+# app, but the app is a plain Python object (rumps.App is not an NSObject
+# subclass in a way AppKit can target). Wrap the per-action callbacks in a
+# tiny NSObject so AppKit can invoke them.
+
+
+class _MenuActionTarget(NSObject):
+    """Generic NSObject target for NSMenuItem callbacks. Carries a
+    Python callable in representedObject (we use a closure list, since
+    representedObject must be ObjC-bridgeable, by indexing into a
+    keep-alive dict on the target)."""
+
+    def initWithApp_(self, app):  # noqa: N802
+        self = objc.super(_MenuActionTarget, self).init()
+        if self is None:
+            return None
+        self.app = app
+        return self
+
+    def invokeCopyPID_(self, sender):  # noqa: N802
+        pid = sender.representedObject()
+        self.app._make_copy_pid(int(pid))(None)
+
+    def invokeShowActivity_(self, sender):  # noqa: N802
+        pid = sender.representedObject()
+        self.app._make_show_activity_monitor(int(pid))(None)
+
+    def invokeSIGTERM_(self, sender):  # noqa: N802
+        info = sender.representedObject()  # [pid, name]
+        pid, name = int(info[0]), str(info[1])
+        self.app._make_kill(pid, name, signal.SIGTERM)(None)
+
+    def invokeSIGKILL_(self, sender):  # noqa: N802
+        info = sender.representedObject()
+        pid, name = int(info[0]), str(info[1])
+        self.app._make_kill(pid, name, signal.SIGKILL)(None)
+
+
+# ===========================================================================
+# Status item click target — toggles the popover
+# ===========================================================================
+#
+# rumps installs the NSStatusItem and sets its menu to the rumps NSMenu.
+# We override that by setMenu_(None) and binding the button's target/action
+# to our togglePopover_ selector — clicking the menu bar item now opens our
+# NSPopover instead of dropping rumps's NSMenu.
+
+
+class _StatusClickTarget(NSObject):
+    """NSObject target/action for the status bar button. Toggles the
+    popover open/closed and anchors it under the status bar button."""
+
+    def initWithApp_(self, app):  # noqa: N802
+        self = objc.super(_StatusClickTarget, self).init()
+        if self is None:
+            return None
+        self.app = app
+        return self
+
+    def togglePopover_(self, sender):  # noqa: N802
+        try:
+            self.app._toggle_popover(sender)
+        except Exception:
+            log.exception("togglePopover failed")
+
+
 class WatchForksApp(rumps.App):
     def __init__(self) -> None:
         super().__init__("watch-forks", title="…", quit_button=None)
@@ -548,120 +1027,117 @@ class WatchForksApp(rumps.App):
         self.last_total_cpu: Optional[float] = None
         self.cpu_trend: str = "steady"
 
-        # Build menu structure once; subsequent ticks mutate items in
-        # place so the menu stays open during refresh.
-        self._build_menu()
+        # Bar context cached between snapshot collection and per-row
+        # rendering — bar_max + name_width depend on the whole snapshot,
+        # but the row view needs them per-row.
+        self._bar_context: dict = {"bar_max": 0.0, "name_width": 16}
+
+        # Popover + view controller — built lazily on first toggle so
+        # we don't pay the construction cost if the operator never opens
+        # the popover, but constructed once and reused thereafter.
+        self._popover: Optional[NSPopover] = None
+        self._vc: Optional[WatchForksViewController] = None
+        self._menu_action_target: Optional[_MenuActionTarget] = None
+        self._status_click_target: Optional[_StatusClickTarget] = None
+
+        # Hide rumps's default NSMenu — the status item action is rebound
+        # to togglePopover_ in _bind_status_item_to_popover.
+        self._bind_status_item_to_popover()
 
         # Initial render BEFORE timer arms — title is non-empty at first display.
         self._tick()
 
-        # NSTimer in common modes — fires during menu tracking too.
+        # NSTimer in common modes — fires during menu / popover tracking too.
         self._tick_handler = _TickHandler.alloc().initWithApp_(self)
         self._ns_timer = None
         self._reschedule_timer()
 
-    # ----- menu construction (once) -----
+    # ----- status item binding (replace rumps's NSMenu with togglePopover_) -----
 
-    def _build_menu(self) -> None:
-        """Build the entire menu structure once. _tick() mutates items
-        in place; clear()+rebuild would close the menu mid-open."""
-        # Header — current/max processes
-        self.header_item = rumps.MenuItem("…")
-        self.header_item.set_callback(None)
-        self.menu.add(self.header_item)
-        self.menu.add(rumps.separator)
+    def _bind_status_item_to_popover(self) -> None:
+        """Detach rumps's NSMenu from the status item and route clicks to
+        our togglePopover_ instead. The status item itself stays owned by
+        rumps (it manages title updates) — we just commandeer the click.
 
-        # Pool of MAX_TOP row items, each with its full submenu pre-built.
-        # We mutate titles / callbacks per tick; rows beyond self.top get
-        # hidden via NSMenuItem.setHidden_.
-        self.row_items: list[rumps.MenuItem] = []
-        self.row_state: list[Optional[int]] = []  # PID currently shown per slot
-        for i in range(MAX_TOP):
-            row = rumps.MenuItem(f"_row_slot_{i}")
-            # Disabled-detail lines + action items, pre-allocated.
-            for key in (
-                "pid_line", "forks_line", "threads_ln",
-                "cpu_self_line", "cpu_tree_line", "state_line",
-            ):
-                it = rumps.MenuItem(key)
-                it.set_callback(None)
-                row[key] = it
-            row["sep1"] = rumps.separator
-            # Action items get their callbacks rebound each tick (PID changes).
-            row["Copy PID"] = rumps.MenuItem("Copy PID", callback=lambda _s: None)
-            row["Show in Activity Monitor"] = rumps.MenuItem(
-                "Show in Activity Monitor", callback=lambda _s: None
-            )
-            row["sep2"] = rumps.separator
-            row["Send SIGTERM (15)"] = rumps.MenuItem(
-                "Send SIGTERM (15)", callback=lambda _s: None
-            )
-            row["Send SIGKILL (9)"] = rumps.MenuItem(
-                "Send SIGKILL (9)", callback=lambda _s: None
-            )
-            self.menu.add(row)
-            self.row_items.append(row)
-            self.row_state.append(None)
+        rumps creates the NSStatusItem inside applicationDidFinishLaunching,
+        which fires *after* __init__ returns (the runloop hasn't started
+        yet). So we just allocate the click target here; the actual rebind
+        happens in _maybe_rebind_status_item, called from _tick — by then
+        the runloop is up and the status item exists.
+        """
+        self._status_click_target = _StatusClickTarget.alloc().initWithApp_(self)
 
-        # Static tail
-        self.menu.add(rumps.separator)
-        self.refresh_item = rumps.MenuItem(
-            "Refresh now", callback=self._refresh_now, key="r"
+    def _maybe_rebind_status_item(self) -> None:
+        """Idempotent: detach rumps's NSMenu and bind click to togglePopover_.
+
+        Called from every _tick — the second-and-later calls are cheap
+        because we early-out once the binding is done. We do this from
+        _tick so we're guaranteed to be inside the runloop, by which
+        time rumps has created the status item."""
+        if getattr(self, "_status_bound", False):
+            return
+        nsapp = getattr(self, "_nsapp", None)
+        if nsapp is None:
+            return
+        item = getattr(nsapp, "nsstatusitem", None)
+        if item is None:
+            return
+        # Disconnect rumps's NSMenu — without this, AppKit routes clicks to
+        # popUpMenu before our action fires, and the popover never opens.
+        item.setMenu_(None)
+        btn = item.button() if hasattr(item, "button") else None
+        if btn is None:
+            log.warning("status item has no button() — cannot bind popover")
+            return
+        btn.setTarget_(self._status_click_target)
+        btn.setAction_(b"togglePopover:")
+        self._status_bound = True
+        log.info("status item bound to togglePopover")
+
+    # ----- popover lifecycle -----
+
+    def _ensure_popover(self) -> NSPopover:
+        """Construct the NSPopover + WatchForksViewController on first
+        toggle. Subsequent calls return the cached popover."""
+        if self._popover is not None:
+            return self._popover
+        vc = WatchForksViewController.alloc().init()
+        vc.setApp_(self)
+        # Force loadView to run by accessing .view() — gives us a chance
+        # to populate the initial header/rows before the popover opens.
+        _ = vc.view()
+        self._vc = vc
+
+        popover = NSPopover.alloc().init()
+        popover.setContentViewController_(vc)
+        popover.setBehavior_(NSPopoverBehaviorTransient)
+        # Sizing — content view's intrinsic size carries through, but set
+        # a reasonable default content size so the popover doesn't open
+        # at 0×0 in case auto-layout hasn't computed yet.
+        popover.setContentSize_(NSMakeSize(POPOVER_WIDTH, 600.0))
+        self._popover = popover
+        log.info("popover constructed (width=%.0f)", POPOVER_WIDTH)
+        return popover
+
+    def _toggle_popover(self, sender) -> None:
+        """Click handler — toggle popover visibility, anchored under the
+        status bar button. Re-renders fresh data before opening so the
+        popover never flashes stale content from the prior open."""
+        popover = self._ensure_popover()
+        if popover.isShown():
+            popover.performClose_(None)
+            return
+        # Repopulate before showing so opening the popover always
+        # reflects the live snapshot, even between timer ticks.
+        try:
+            self._tick()
+        except Exception:
+            log.exception("pre-open tick failed")
+        # Activate so the popover gets keyboard focus + comes forward.
+        NSApp.activateIgnoringOtherApps_(True)
+        popover.showRelativeToRect_ofView_preferredEdge_(
+            sender.bounds(), sender, NSRectEdgeMinY,
         )
-        self.menu.add(self.refresh_item)
-
-        self.interval_menu = rumps.MenuItem("Interval")
-        for sec in INTERVAL_CHOICES:
-            label = interval_label(sec)
-            it = rumps.MenuItem(label, callback=self._make_set_interval(sec))
-            it.state = 1 if sec == self.interval else 0
-            self.interval_menu[label] = it
-        self.menu.add(self.interval_menu)
-
-        self.top_menu = rumps.MenuItem("Top N")
-        for n in TOP_CHOICES:
-            label = f"{n}"
-            it = rumps.MenuItem(label, callback=self._make_set_top(n))
-            it.state = 1 if n == self.top else 0
-            self.top_menu[label] = it
-        self.menu.add(self.top_menu)
-
-        self.sort_menu = rumps.MenuItem("Sort by")
-        for key, label in SORT_CHOICES:
-            it = rumps.MenuItem(label, callback=self._make_set_sort(key))
-            it.state = 1 if key == self.sort_by else 0
-            self.sort_menu[label] = it
-        self.menu.add(self.sort_menu)
-
-        # No state= here — the top-level menu's state column is suppressed
-        # (see _build_menu's tail), so checkmarks won't render. Convey
-        # toggle state via the title text instead.
-        self.login_item = rumps.MenuItem(
-            self._login_title(), callback=self._toggle_login
-        )
-        self.menu.add(self.login_item)
-
-        self.menu.add(rumps.separator)
-        self.terminal_item = rumps.MenuItem(
-            "Open full table in Terminal…", callback=self._open_terminal
-        )
-        self.menu.add(self.terminal_item)
-        self.menu.add(rumps.separator)
-        self.quit_item = rumps.MenuItem(
-            "Quit watch-forks", callback=rumps.quit_application, key="q"
-        )
-        self.menu.add(self.quit_item)
-
-        # Collapse NSMenu's state-indicator column on the top-level menu so
-        # the rows start flush against the popup's left edge — without this,
-        # NSMenu reserves a fixed gutter for checkmarks/radio dots on every
-        # row even when none are set. Submenus (Interval / Top N / Sort by)
-        # are separate NSMenu instances and keep their state column for
-        # radio rendering. Toggle items in the top-level menu (Hide launchd,
-        # Start at login) convey state via title flip instead of checkmark.
-        ns_menu = getattr(self.menu, "_menu", None)
-        if ns_menu is not None and hasattr(ns_menu, "setShowsStateColumn_"):
-            ns_menu.setShowsStateColumn_(False)
 
     # ----- data collection (delegate to watch-forks) -----
 
@@ -751,9 +1227,120 @@ class WatchForksApp(rumps.App):
                 del self.pid_history[pid]
                 self.pid_severity.pop(pid, None)
 
-    # ----- render (mutates existing items in place) -----
+    # ============================================================================
+    # OVERRIDE POINTS — Phases 3 & 4 will replace these four methods.
+    # ============================================================================
+    #
+    # The create_*_view methods return an NSView. The update_*_view methods
+    # mutate it in place — never destroy and rebuild on tick, both for
+    # flicker reasons and because mid-popover layout thrash is jarring.
+    #
+    # Contract:
+    #   - row_data is a 7-tuple matching watch-forks's snapshot row, or None
+    #     when called by syncRowCount_ to construct a fresh blank slot
+    #     (the next _update_row_view call immediately populates it).
+    #   - bar_context is {bar_max: float, name_width: int} — shared across
+    #     all rows in a tick. None ⇔ blank construction.
+    #   - launchd_data is the 7-tuple for PID 1 (the row data), or None
+    #     when no data has been collected yet.
+    #
+    # Phase 3: replace _create_row_view to return a composite NSView
+    # (icon + name label + fork-count gauge + CPU gauge + sparkline).
+    # Phase 4: replace _create_header_view with a multi-sparkline view
+    # (total procs, total CPU, fork rate over time).
+
+    def _create_row_view(self, row_data, bar_context):
+        """Construct a row view from a snapshot tuple.
+
+        Phase 2: return a monospaced NSTextField (subclass with right-click
+        context menu support — see _PlaceholderRowView). Phase 3 will
+        replace this with a rich composite view; the (row_data, bar_context)
+        contract stays the same so the app's tick loop is unchanged."""
+        view = _PlaceholderRowView.alloc().initFrame_(NSMakeRect(0.0, 0.0, POPOVER_WIDTH - 30.0, 18.0))
+        view.setBezeled_(False)
+        view.setDrawsBackground_(False)
+        view.setEditable_(False)
+        view.setSelectable_(False)
+        view.setFont_(_MONO_FONT)
+        view.setStringValue_("")
+        # If we have data right now, populate immediately so the view isn't
+        # blank during the moment between create and the next update.
+        if row_data is not None and bar_context is not None:
+            self._update_row_view(view, row_data, bar_context)
+        return view
+
+    def _update_row_view(self, view, row_data, bar_context):
+        """Mutate the row view's display to reflect new data.
+
+        Phase 2: rewrite the NSTextField's stringValue and rebind the
+        per-row identity (pid, name) so the right-click context menu
+        targets the right process. Phase 3 will update subviews instead."""
+        forks_n, threads_n, pid, pcpu, stat, name, acc_cpu = row_data
+        bar_max = bar_context["bar_max"]
+        name_width = bar_context["name_width"]
+        # Bar value tracks the active sort dimension so the gauge stays
+        # visually aligned with whichever number is driving the order.
+        bar_value = acc_cpu if self.sort_by == "cpu" else float(forks_n)
+        # bar() is integer-valued; coerce both sides into ints scaled up
+        # so fractional CPU values still rank correctly on the log curve.
+        bar_str = bar(int(bar_value * 10), int(max(bar_max, 0.1) * 10), width=8)
+        row_emoji = SEV_BY_STATE[self.pid_severity.get(pid, "cold")]
+        # Single space between every column — tighter than the legacy
+        # 2-space layout. width-3 right-justification on forks covers up
+        # to 999 (launchd tops out around 800 in steady state); the bar
+        # is fixed-width so the CPU and name columns still align.
+        display = (
+            f"{row_emoji} {forks_n:>3} {bar_str} "
+            f"{acc_cpu:>6.1f}%  {fmt_name(name, name_width)}"
+        )
+        view.setStringValue_(display)
+        # Update the per-row identity so the context menu targets this PID.
+        if isinstance(view, _PlaceholderRowView):
+            view.setRowApp_pid_name_(self, pid, name)
+
+    def _create_header_view(self, launchd_data):
+        """Construct the header view from a launchd snapshot tuple.
+
+        Phase 2: return a monospaced NSTextField. Phase 4 will replace
+        this with a multi-sparkline overview (total procs, total CPU,
+        fork rate)."""
+        view = _mono_text_field("…")
+        if launchd_data is not None:
+            self._update_header_view(view, launchd_data)
+        return view
+
+    def _update_header_view(self, view, launchd_data):
+        """Mutate the header view to reflect new data.
+
+        Phase 2: rewrite the NSTextField's stringValue. Phase 4 will
+        update sparkline buffers instead.
+
+        launchd_data is the full PID-1 row tuple OR None (no PID 1 in
+        snapshot — fall back to a degraded message). The total_procs
+        fallback is read off self for the degraded case so the header
+        never says "n/a" when we know the procs count."""
+        if launchd_data is None:
+            view.setStringValue_(
+                f"launchd · n/a (procs={len(self._last_snapshot)})"
+            )
+            return
+        forks_n, threads_n, pid, _, _, _, acc_cpu = launchd_data
+        pid1_emoji = SEV_BY_STATE[self.pid_severity.get(1, "cold")]
+        view.setStringValue_(
+            f"{pid1_emoji} launchd · {forks_n} forks · "
+            f"{threads_n} threads · {acc_cpu:.1f}% CPU"
+        )
+
+    # ============================================================================
+    # END OVERRIDE POINTS
+    # ============================================================================
+
+    # ----- render (mutates existing views in place) -----
 
     def _tick(self) -> None:
+        # Late-bind the status item to togglePopover_ once it exists.
+        self._maybe_rebind_status_item()
+
         try:
             snap = self._collect()
         except subprocess.CalledProcessError:
@@ -769,7 +1356,7 @@ class WatchForksApp(rumps.App):
         # Σ pcpu over every row = system-wide CPU%. By construction
         # this equals the root's subtree-accumulated value (launchd
         # is ancestor of every user process), so the top row in the
-        # dropdown carries the same number as the menubar title.
+        # popover carries the same number as the menubar title.
         total_cpu = 0.0
         for _, _, _, pcpu, _, _, _ in snap:
             total_cpu += parse_pcpu(pcpu)
@@ -794,23 +1381,20 @@ class WatchForksApp(rumps.App):
         trend_glyph = TREND_BY_STATE[self.cpu_trend]
         self.title = f"{emoji} {total_procs} / {total_cpu:.0f}% {trend_glyph}"
 
+        # If the popover hasn't been built yet, the menubar title is the
+        # only visible surface — bail before touching view hierarchies.
+        if self._vc is None:
+            return
+
         # Header — PID 1 (launchd) details. launchd is the ancestor of every
         # user process on macOS, so its acc_cpu == total system CPU and its
         # forks count is the per-uid direct-child population. Defensive
-        # fallback to total_procs only on the unlikely event ps omits PID 1.
+        # fallback when ps omits PID 1.
         pid1 = next((r for r in snap if r[2] == 1), None)
-        if pid1 is not None:
-            forks_n, threads_n, _, _, _, _, acc_cpu = pid1
-            pid1_emoji = SEV_BY_STATE[self.pid_severity.get(1, "cold")]
-            header_text = (
-                f"{pid1_emoji} launchd · {forks_n} forks · "
-                f"{threads_n} threads · {acc_cpu:.1f}% CPU"
-            )
-        else:
-            header_text = f"launchd · n/a (procs={total_procs})"
-        set_mono_title(self.header_item, header_text)
+        self._update_header_view(self._vc._header_view, pid1)
 
-        # Rows — mutate the pool in place; show first `top`, hide the rest.
+        # Rows — mutate the view pool in place; resize the pool to match
+        # the active top-N, then update each visible row.
         # Bar value tracks the active sort dimension so the gauge stays
         # visually aligned with whichever number is driving the order.
         # PID 1 (launchd) is always filtered out — its data is in the
@@ -825,124 +1409,117 @@ class WatchForksApp(rumps.App):
             bar_max = float(display_snap[0][0]) if display_snap else 0.0
         name_width = max((len(r[5]) for r in display_snap[:top_n]), default=16)
         name_width = min(max(name_width, 16), 28)
+        self._bar_context = {"bar_max": bar_max, "name_width": name_width}
 
-        for i in range(MAX_TOP):
-            row = self.row_items[i]
-            if i < top_n:
-                forks_n, threads_n, pid, pcpu, stat, name, acc_cpu = display_snap[i]
-                self._populate_row(
-                    row, forks_n, threads_n, pid, pcpu, stat, name, acc_cpu,
-                    bar_max, name_width,
+        # Resize the row stack to top_n slots (cheap when unchanged).
+        self._vc.syncRowCount_(top_n)
+        for i in range(top_n):
+            self._update_row_view(
+                self._vc._row_views[i], display_snap[i], self._bar_context
+            )
+
+    # ----- per-row context menu -----
+
+    def _build_row_context_menu(self, pid: int, name: str) -> NSMenu:
+        """Construct the right-click context menu for a row view. Built
+        fresh on each right-click — the cost is microseconds, and rebuilding
+        avoids keeping per-row NSMenu state across ticks."""
+        # Lazy-init the shared action target — one instance per app,
+        # shared across all rows. We carry the (pid, name) per item via
+        # representedObject so the target methods know which row fired.
+        if self._menu_action_target is None:
+            self._menu_action_target = _MenuActionTarget.alloc().initWithApp_(self)
+        target = self._menu_action_target
+
+        menu = NSMenu.alloc().init()
+        menu.setAutoenablesItems_(False)
+
+        # Per-row detail header — informational only.
+        # Pull the latest data for this PID from the last snapshot so the
+        # menu always shows current numbers even if the row hasn't been
+        # rendered yet this tick.
+        row = next((r for r in self._last_snapshot if r[2] == pid), None)
+        if row is not None:
+            forks_n, threads_n, _, pcpu, stat, _, acc_cpu = row
+            for line in (
+                f"PID         {pid}",
+                f"Forks       {forks_n}",
+                f"Threads     {threads_n}",
+                f"CPU (self)  {parse_pcpu(pcpu):>5.1f}%",
+                f"CPU (tree)  {acc_cpu:>5.1f}%",
+                f"State       {decode_stat(stat)}",
+            ):
+                it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    line, None, ""
                 )
-                row._menuitem.setHidden_(False)
-                self.row_state[i] = pid
-            else:
-                row._menuitem.setHidden_(True)
-                self.row_state[i] = None
+                it.setEnabled_(False)
+                # Use the same monospaced font for alignment.
+                attr = NSAttributedString.alloc().initWithString_attributes_(
+                    line, _MONO_ATTRS
+                )
+                it.setAttributedTitle_(attr)
+                menu.addItem_(it)
+            menu.addItem_(NSMenuItem.separatorItem())
 
-    def _populate_row(
-        self,
-        row: rumps.MenuItem,
-        forks_n: int,
-        threads_n: int,
-        pid: int,
-        pcpu: str,
-        stat: str,
-        name: str,
-        acc_cpu: float,
-        bar_max: float,
-        name_width: int,
-    ) -> None:
-        """Mutate the row's title, submenu detail lines, and action callbacks
-        for a new (pid, name) tuple. Does NOT add or remove items — every
-        slot in the pool was pre-allocated in _build_menu."""
-        # Row layout: emoji · forks · bar · subtree-cpu% · name
-        bar_value = acc_cpu if self.sort_by == "cpu" else float(forks_n)
-        # bar() is integer-valued; coerce both sides into ints scaled up
-        # so fractional CPU values still rank correctly on the log curve.
-        bar_str = bar(int(bar_value * 10), int(max(bar_max, 0.1) * 10), width=8)
-        row_emoji = SEV_BY_STATE[self.pid_severity.get(pid, "cold")]
-        # Single space between every column — tighter than the previous
-        # 2-space layout. width-3 right-justification on forks covers up
-        # to 999 (launchd tops out around 800 in steady state); the bar
-        # is fixed-width so the CPU and name columns still align.
-        display = (
-            f"{row_emoji} {forks_n:>3} {bar_str} "
-            f"{acc_cpu:>6.1f}%  {fmt_name(name, name_width)}"
+        # Actions.
+        copy_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Copy PID", b"invokeCopyPID:", ""
         )
-        set_mono_title(row, display)
+        copy_it.setTarget_(target)
+        copy_it.setRepresentedObject_(pid)
+        menu.addItem_(copy_it)
 
-        # Detail lines (greyed) — split self-CPU from subtree-CPU so the
-        # operator can see both. Σ self-CPU across all rows = menubar
-        # total; subtree-CPU is what the row's CPU column displays.
-        for key, text in (
-            ("pid_line",      f"PID         {pid}"),
-            ("forks_line",    f"Forks       {forks_n}"),
-            ("threads_ln",    f"Threads     {threads_n}"),
-            ("cpu_self_line", f"CPU (self)  {parse_pcpu(pcpu):>5.1f}%"),
-            ("cpu_tree_line", f"CPU (tree)  {acc_cpu:>5.1f}%"),
-            ("state_line",    f"State       {decode_stat(stat)}"),
-        ):
-            set_mono_title(row[key], text)
+        am_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Show in Activity Monitor", b"invokeShowActivity:", ""
+        )
+        am_it.setTarget_(target)
+        am_it.setRepresentedObject_(pid)
+        menu.addItem_(am_it)
 
-        # Action callbacks — rebind to current PID/name.
-        row["Copy PID"].set_callback(self._make_copy_pid(pid))
-        row["Show in Activity Monitor"].set_callback(
-            self._make_show_activity_monitor(pid)
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        term_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Send SIGTERM (15)", b"invokeSIGTERM:", ""
         )
-        row["Send SIGTERM (15)"].set_callback(
-            self._make_kill(pid, name, signal.SIGTERM)
+        term_it.setTarget_(target)
+        term_it.setRepresentedObject_([pid, name])
+        menu.addItem_(term_it)
+
+        kill_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Send SIGKILL (9)", b"invokeSIGKILL:", ""
         )
-        row["Send SIGKILL (9)"].set_callback(
-            self._make_kill(pid, name, signal.SIGKILL)
-        )
+        kill_it.setTarget_(target)
+        kill_it.setRepresentedObject_([pid, name])
+        menu.addItem_(kill_it)
+
+        return menu
 
     # ----- callbacks -----
 
     def _refresh_now(self, _sender) -> None:
         self._tick()
 
-    def _make_set_interval(self, sec: float):
-        target_label = interval_label(sec)
+    def _apply_interval(self, sec: float) -> None:
+        self.interval = sec
+        self._persist_settings()
+        self._reschedule_timer()
+        self._tick()
 
-        def _cb(_sender):
-            self.interval = sec
-            self._persist_settings()
-            for label, item in self.interval_menu.items():
-                item.state = 1 if label == target_label else 0
-            self._reschedule_timer()
-            self._tick()
-        return _cb
+    def _apply_top(self, n: int) -> None:
+        self.top = n
+        self._persist_settings()
+        self._tick()
 
-    def _make_set_top(self, n: int):
-        def _cb(_sender):
-            self.top = n
-            self._persist_settings()
-            for label, item in self.top_menu.items():
-                item.state = 1 if label == f"{n}" else 0
-            self._tick()
-        return _cb
-
-    def _make_set_sort(self, key: str):
-        target_label = next(label for k, label in SORT_CHOICES if k == key)
-
-        def _cb(_sender):
-            self.sort_by = key
-            self._persist_settings()
-            for label, item in self.sort_menu.items():
-                item.state = 1 if label == target_label else 0
-            log.info("sort_by → %s", key)
-            self._tick()
-        return _cb
-
-    def _login_title(self) -> str:
-        return "Disable start at login" if is_login_enabled() else "Start at login"
+    def _apply_sort(self, key: str) -> None:
+        self.sort_by = key
+        self._persist_settings()
+        log.info("sort_by → %s", key)
+        self._tick()
 
     def _toggle_login(self, _sender) -> None:
         if is_login_enabled():
             ok = disable_login()
             if ok:
-                self.login_item.title = self._login_title()
                 floating_alert(
                     title="Start at login disabled",
                     message=(
@@ -953,7 +1530,6 @@ class WatchForksApp(rumps.App):
         else:
             ok = enable_login()
             if ok:
-                self.login_item.title = self._login_title()
                 floating_alert(
                     title="Start at login enabled",
                     message=(
@@ -963,18 +1539,18 @@ class WatchForksApp(rumps.App):
                     ),
                 )
 
-    def _make_copy_pid(self, pid: int):
+    def _make_copy_pid(self, pid: int) -> Callable:
         def _cb(_sender):
             subprocess.run(["pbcopy"], input=str(pid), text=True, check=False)
         return _cb
 
-    def _make_show_activity_monitor(self, pid: int):
+    def _make_show_activity_monitor(self, pid: int) -> Callable:
         def _cb(_sender):
             # AM doesn't accept a PID arg, but opening it is still useful.
             subprocess.run(["open", "-a", "Activity Monitor"], check=False)
         return _cb
 
-    def _make_kill(self, pid: int, name: str, sig: int):
+    def _make_kill(self, pid: int, name: str, sig: int) -> Callable:
         sig_name = "SIGKILL (-9)" if sig == signal.SIGKILL else "SIGTERM (-15)"
 
         def _cb(_sender):
@@ -1045,13 +1621,14 @@ class WatchForksApp(rumps.App):
 
     def _reschedule_timer(self) -> None:
         """Invalidate any existing timer and schedule a new one in
-        NSRunLoopCommonModes — this is what makes the menu refresh
-        while open. NSTimer.scheduledTimer... uses default mode only,
-        which is suspended during menu tracking; common modes covers
-        both default AND NSEventTrackingRunLoopMode.
+        NSRunLoopCommonModes. NSPopover (unlike NSMenu) doesn't strictly
+        suspend the default mode while it's open, but common modes is
+        harmless and keeps the driver consistent for any future tracking
+        modes (e.g., NSEventTrackingRunLoopMode during a popover drag).
 
         Manual mode (interval == 0.0) leaves no timer armed — the data
-        only updates when the operator picks "Refresh now"."""
+        only updates when the operator picks "Refresh" or the popover
+        is toggled open (which forces a pre-show tick)."""
         if self._ns_timer is not None:
             self._ns_timer.invalidate()
             self._ns_timer = None
