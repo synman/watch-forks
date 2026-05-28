@@ -56,6 +56,7 @@ import objc
 import rumps
 from AppKit import (
     NSAlert,
+    NSAnimationContext,
     NSApp,
     NSAttributedString,
     NSBezierPath,
@@ -81,6 +82,7 @@ from AppKit import (
     NSMenu,
     NSMenuItem,
     NSPopover,
+    NSPopoverBehaviorSemitransient,
     NSPopoverBehaviorTransient,
     NSRectEdgeMinY,
     NSScrollView,
@@ -92,6 +94,10 @@ from AppKit import (
     NSStackViewGravityTop,
     NSStackViewGravityTrailing,
     NSTextField,
+    NSTrackingArea,
+    NSTrackingMouseEnteredAndExited,
+    NSTrackingActiveInKeyWindow,
+    NSTrackingInVisibleRect,
     NSUserInterfaceLayoutOrientationHorizontal,
     NSUserInterfaceLayoutOrientationVertical,
     NSView,
@@ -101,7 +107,9 @@ from AppKit import (
 from Foundation import (
     NSMakeRect,
     NSMakeSize,
+    NSNotificationCenter,
     NSObject,
+    NSOperationQueue,
     NSPoint,
     NSRunLoop,
     NSRunLoopCommonModes,
@@ -548,21 +556,16 @@ def _make_severity_image(severity: str) -> Optional[NSImage]:
 
 
 def _heat_color(fraction: float) -> NSColor:
-    """Interpolate a heat color: blue (0) → orange (0.5) → red (1.0)."""
+    """Return a semantic system color on the heat scale: blue → orange → red.
+
+    Uses dynamic NSColor.system* colors so the fill adapts automatically in
+    light and dark mode — no hardcoded RGB values."""
     frac = max(0.0, min(1.0, fraction))
-    if frac <= 0.5:
-        # blue → orange
-        t = frac / 0.5
-        r = t * 1.0
-        g = t * 0.6
-        b = 1.0 - t * 1.0
-    else:
-        # orange → red
-        t = (frac - 0.5) / 0.5
-        r = 1.0
-        g = 0.6 * (1.0 - t)
-        b = 0.0
-    return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
+    if frac <= 0.33:
+        return NSColor.systemBlueColor()
+    if frac <= 0.66:
+        return NSColor.systemOrangeColor()
+    return NSColor.systemRedColor()
 
 
 # --- SparklineView ---
@@ -660,8 +663,24 @@ class HeatGaugeView(NSView):
         return self
 
     def setFraction_(self, fraction):  # noqa: N802
-        self._fraction = max(0.0, min(1.0, float(fraction)))
-        self.setNeedsDisplay_(True)
+        """Update the fill fraction with a short ease-out animation (Phase 5)."""
+        new_fraction = max(0.0, min(1.0, float(fraction)))
+        if abs(new_fraction - self._fraction) < 0.001:
+            return  # skip animation for negligible changes
+        self._fraction = new_fraction
+        # Wrap the redraw in a 0.25s ease-out animation context so AppKit
+        # smooths any layer-backed transitions during the repaint.
+        def _do_draw():
+            self.setNeedsDisplay_(True)
+        try:
+            NSAnimationContext.runAnimationGroup_completionHandler_(
+                lambda ctx: (
+                    ctx.setDuration_(0.25),
+                ),
+                _do_draw,
+            )
+        except Exception:
+            self.setNeedsDisplay_(True)
 
     def drawRect_(self, dirty_rect):  # noqa: N802
         bounds = self.bounds()
@@ -710,7 +729,11 @@ class RichRowView(NSView):
     sparkline | heat gauge | CPU% label.
 
     Created once per row slot; updated in place per tick via update_().
-    Carries the per-row PID/name and builds the context menu on right-click."""
+    Carries the per-row PID/name and builds the context menu on right-click.
+
+    Phase 5: hover state — mouseEntered_ sets an accent-color tint background;
+    mouseExited_ restores transparent background. NSTrackingArea installed in
+    viewDidMoveToWindow / updateTrackingAreas."""
 
     def initWithFrame_(self, frame):  # noqa: N802
         self = objc.super(RichRowView, self).initWithFrame_(frame)
@@ -719,8 +742,42 @@ class RichRowView(NSView):
         self._pid: Optional[int] = None
         self._name: str = ""
         self._app = None
+        self._tracking_area = None
+        self._hovered: bool = False
+        self.setWantsLayer_(True)
         self._build_subviews()
         return self
+
+    def viewDidMoveToWindow(self):  # noqa: N802
+        """Install the tracking area whenever we're added to a window."""
+        objc.super(RichRowView, self).viewDidMoveToWindow()
+        self.updateTrackingAreas()
+
+    def updateTrackingAreas(self):  # noqa: N802
+        """Replace the old tracking area with a fresh one sized to bounds."""
+        objc.super(RichRowView, self).updateTrackingAreas()
+        if self._tracking_area is not None:
+            self.removeTrackingArea_(self._tracking_area)
+            self._tracking_area = None
+        opts = (
+            NSTrackingMouseEnteredAndExited
+            | NSTrackingActiveInKeyWindow
+            | NSTrackingInVisibleRect
+        )
+        ta = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(), opts, self, None
+        )
+        self.addTrackingArea_(ta)
+        self._tracking_area = ta
+
+    def mouseEntered_(self, event):  # noqa: N802
+        self._hovered = True
+        accent = NSColor.controlAccentColor().colorWithAlphaComponent_(0.12)
+        self.layer().setBackgroundColor_(accent.CGColor())
+
+    def mouseExited_(self, event):  # noqa: N802
+        self._hovered = False
+        self.layer().setBackgroundColor_(None)
 
     def _build_subviews(self):
         """Construct all subviews and position them with fixed frames.
@@ -1742,6 +1799,17 @@ class _StatusClickTarget(NSObject):
             log.exception("togglePopover failed")
 
 
+class _PopoverDelegate(NSObject):
+    """NSPopoverDelegate that allows the popover to be detached into a
+    floating window by dragging — Phase 5 optional feature.
+
+    macOS handles the detachment entirely once popoverShouldDetach_
+    returns True; no additional code required."""
+
+    def popoverShouldDetach_(self, popover):  # noqa: N802
+        return True
+
+
 class WatchForksApp(rumps.App):
     def __init__(self) -> None:
         super().__init__("watch-forks", title="…", quit_button=None)
@@ -1798,6 +1866,11 @@ class WatchForksApp(rumps.App):
         # to togglePopover_ in _bind_status_item_to_popover.
         self._bind_status_item_to_popover()
 
+        # Phase 5: observe NSApplicationDidChangeEffectiveAppearanceNotification
+        # so custom-drawn views repaint when the user switches light ↔ dark mode.
+        self._appearance_observer = None
+        self._install_appearance_observer()
+
         # Initial render BEFORE timer arms — title is non-empty at first display.
         self._tick()
 
@@ -1848,6 +1921,40 @@ class WatchForksApp(rumps.App):
         self._status_bound = True
         log.info("status item bound to togglePopover")
 
+    # ----- light/dark mode observer (Phase 5) -----
+
+    def _install_appearance_observer(self) -> None:
+        """Subscribe to NSApplicationDidChangeEffectiveAppearanceNotification.
+
+        On notification, call setNeedsDisplay_(True) on all custom-drawn
+        views in the popover so they repaint with the new effective colors.
+        Uses addObserverForName_object_queue_usingBlock_ (block-based API,
+        no NSObject subclass required)."""
+        nc = NSNotificationCenter.defaultCenter()
+        # Keep the observer token so we can remove it if needed.
+        self._appearance_observer = nc.addObserverForName_object_queue_usingBlock_(
+            "NSApplicationDidChangeEffectiveAppearanceNotification",
+            None,
+            NSOperationQueue.mainQueue(),
+            self._on_appearance_change,
+        )
+
+    def _on_appearance_change(self, notification) -> None:
+        """Repaint all custom-drawn views when light/dark mode changes."""
+        if self._vc is None:
+            return
+        # Header panels
+        header = self._vc._header_view
+        if header is not None:
+            for panel in (header._cpu_panel, header._procs_panel, header._rate_panel):
+                panel.setNeedsDisplay_(True)
+        # Row views
+        for view in self._vc._row_views:
+            if isinstance(view, RichRowView):
+                view._spark_view.setNeedsDisplay_(True)
+                view._gauge_view.setNeedsDisplay_(True)
+                view.setNeedsDisplay_(True)
+
     # ----- popover lifecycle -----
 
     def _ensure_popover(self) -> NSPopover:
@@ -1864,7 +1971,12 @@ class WatchForksApp(rumps.App):
 
         popover = NSPopover.alloc().init()
         popover.setContentViewController_(vc)
-        popover.setBehavior_(NSPopoverBehaviorTransient)
+        # Phase 5: semitransient behavior allows the user to drag the popover
+        # out into a detached floating window; the delegate's
+        # popoverShouldDetach_ returning True enables that.
+        popover.setBehavior_(NSPopoverBehaviorSemitransient)
+        self._popover_delegate = _PopoverDelegate.alloc().init()
+        popover.setDelegate_(self._popover_delegate)
         # Sizing — content view's intrinsic size carries through, but set
         # a reasonable default content size so the popover doesn't open
         # at 0×0 in case auto-layout hasn't computed yet.
