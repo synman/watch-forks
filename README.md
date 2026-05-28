@@ -80,6 +80,37 @@ Doing the latter also makes "Start at login" work without venv activation — th
 
 `watch-forks` (the CLI) is stdlib-only and runs under any Python 3.10+.
 
+### Running as a macOS `.app`
+
+The menubar widget can be packaged as a standard macOS application bundle, which unlocks:
+
+- **Real `CFBundleIdentifier`** — enables `rumps.notification` (currently guarded behind bundle identity)
+- **LaunchServices integration** — "Open" from Finder, "Open at Login" Dock integration
+- **Dock-hidden by default** — status-bar-only apps have `LSUIElement=true`
+- **Foundation for custom icons** — bundle structure supports `AppIcon.icns` in Resources/
+
+#### Build the app bundle
+
+```bash
+./build-app-bundle.sh           # Creates build/watch-forks-menubar.app/
+./build-app-bundle.sh --install # Build and install to /Applications/
+```
+
+#### Launch from the bundle
+
+```bash
+# Open with the default launcher
+open build/watch-forks-menubar.app
+
+# Launch directly (same as menu bar symlink, but runs under the bundle identity)
+./build/watch-forks-menubar.app/Contents/MacOS/watch-forks-menubar
+
+# If installed to /Applications
+open /Applications/watch-forks-menubar.app
+```
+
+The bundle still assumes `python3` on `$PATH` has `rumps` + `pyobjc` installed. If you use a virtualenv, either activate it before launching, or modify the wrapper's shebang at `Contents/MacOS/watch-forks-menubar` to point to your venv's interpreter.
+
 ## Usage
 
 ### CLI
