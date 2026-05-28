@@ -59,15 +59,22 @@ from AppKit import (
     NSAlert,
     NSApp,
     NSAttributedString,
+    NSBezierPath,
     NSBezelStyleRounded,
     NSBox,
     NSBoxSeparator,
     NSButton,
+    NSColor,
     NSFloatingWindowLevel,
     NSFont,
     NSFontAttributeName,
+    NSFontWeightMedium,
+    NSImage,
+    NSImageView,
+    NSImageScaleProportionallyDown,
     NSLayoutAttributeBottom,
     NSLayoutAttributeLeading,
+    NSLayoutAttributeCenterY,
     NSMenu,
     NSMenuItem,
     NSPopover,
@@ -83,7 +90,9 @@ from AppKit import (
     NSTextField,
     NSUserInterfaceLayoutOrientationHorizontal,
     NSUserInterfaceLayoutOrientationVertical,
+    NSView,
     NSViewController,
+    NSWorkspace,
 )
 from Foundation import (
     NSMakeRect,
@@ -438,6 +447,398 @@ def bar(value: int, max_value: int, width: int = 8) -> str:
     frac = math.log10(value + 1) / math.log10(max_value + 1)
     filled = max(1, min(width, round(frac * width)))
     return _BAR_FULL * filled + _BAR_EMPTY * (width - filled)
+
+
+# ===========================================================================
+# Phase 3 — rich row view helpers
+# ===========================================================================
+
+# --- Per-PID binary path + icon cache ---
+#
+# resolve_pid_icon() is called once per PID (on row creation) and its result
+# is cached so we never re-run ps on every tick. The cache is a plain dict;
+# PIDs are ephemeral so the dict stays small (bounded by top-N).
+
+_pid_icon_cache: dict[int, NSImage] = {}
+_pid_binary_cache: dict[int, str] = {}
+
+_FALLBACK_ICON_NAME = "gearshape.fill"
+
+
+def _resolve_binary_path(pid: int) -> str:
+    """Return the full executable path for `pid` via `ps -o comm= -p <pid>`.
+    Returns an empty string on any error — callers must handle the empty case."""
+    if pid in _pid_binary_cache:
+        return _pid_binary_cache[pid]
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "comm=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2
+        )
+        path = result.stdout.strip()
+    except Exception:
+        path = ""
+    _pid_binary_cache[pid] = path
+    return path
+
+
+def _resolve_pid_icon(pid: int) -> NSImage:
+    """Return an NSImage for the process icon, cached by PID.
+
+    For processes whose binary lives inside a .app bundle we use
+    NSWorkspace.iconForFile_() on the bundle path; everything else falls
+    back to the SF Symbols terminal / gearshape glyph."""
+    if pid in _pid_icon_cache:
+        return _pid_icon_cache[pid]
+
+    icon = None
+    path = _resolve_binary_path(pid)
+    if path:
+        # Walk up from the binary to the enclosing .app bundle — a typical
+        # macOS app binary lives at Foo.app/Contents/MacOS/Foo.
+        parts = path.split("/")
+        for i, part in enumerate(parts):
+            if part.endswith(".app"):
+                bundle_path = "/".join(parts[: i + 1])
+                icon = NSWorkspace.sharedWorkspace().iconForFile_(bundle_path)
+                break
+
+    if icon is None:
+        # Try SF Symbols "terminal" for CLI processes, fall back to gearshape.
+        icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "terminal", None
+        )
+        if icon is None:
+            icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                _FALLBACK_ICON_NAME, None
+            )
+
+    _pid_icon_cache[pid] = icon
+    return icon
+
+
+def _severity_sf_symbol(severity: str) -> tuple[str, NSColor]:
+    """Return (SF Symbol name, tint color) for a severity string."""
+    if severity == "hot":
+        return "flame.fill", NSColor.systemRedColor()
+    if severity == "warm":
+        return "thermometer.medium", NSColor.systemOrangeColor()
+    # cold (default)
+    return "snowflake", NSColor.systemBlueColor()
+
+
+def _make_severity_image(severity: str) -> Optional[NSImage]:
+    """Build a tinted SF Symbols image for the given severity."""
+    name, color = _severity_sf_symbol(severity)
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+    if img is None:
+        return None
+    # Apply a hierarchical rendering configuration with the target color.
+    try:
+        cfg = objc.lookUpClass("NSImageSymbolConfiguration")
+        hierarchical = cfg.configurationWithHierarchicalColor_(color)
+        return img.imageWithSymbolConfiguration_(hierarchical)
+    except Exception:
+        # Fallback: return un-tinted image if symbol configuration unavailable.
+        return img
+
+
+def _heat_color(fraction: float) -> NSColor:
+    """Interpolate a heat color: blue (0) → orange (0.5) → red (1.0)."""
+    frac = max(0.0, min(1.0, fraction))
+    if frac <= 0.5:
+        # blue → orange
+        t = frac / 0.5
+        r = t * 1.0
+        g = t * 0.6
+        b = 1.0 - t * 1.0
+    else:
+        # orange → red
+        t = (frac - 0.5) / 0.5
+        r = 1.0
+        g = 0.6 * (1.0 - t)
+        b = 0.0
+    return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
+
+
+# --- SparklineView ---
+
+class SparklineView(NSView):
+    """Custom NSView that draws a mini line/area chart of fork-count history.
+
+    Samples are a list of (timestamp, forks_n) tuples — the same format as
+    pid_history deque entries. Up to _MAX_SAMPLES are shown; if fewer than
+    2 samples are available the view renders blank. Color tracks severity.
+    """
+
+    _MAX_SAMPLES = 16
+
+    def initWithFrame_(self, frame):  # noqa: N802
+        self = objc.super(SparklineView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._samples: list[tuple[float, int]] = []
+        self._severity: str = "cold"
+        return self
+
+    def setSamples_severity_(self, samples, severity):  # noqa: N802
+        """Update display data and trigger a redraw. samples is a list of
+        (timestamp, forks_n) tuples; severity is 'cold'/'warm'/'hot'."""
+        # Keep only the last _MAX_SAMPLES.
+        self._samples = list(samples)[-self._MAX_SAMPLES:]
+        self._severity = severity
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, dirty_rect):  # noqa: N802
+        NSColor.clearColor().setFill()
+        NSBezierPath.fillRect_(self.bounds())
+
+        samples = self._samples
+        if len(samples) < 2:
+            return
+
+        bounds = self.bounds()
+        w = bounds.size.width
+        h = bounds.size.height
+        pad_v = 1.5  # vertical padding (px)
+
+        values = [s[1] for s in samples]
+        v_min = min(values)
+        v_max = max(values)
+        v_range = max(v_max - v_min, 1)  # avoid divide-by-zero
+
+        n = len(samples)
+
+        def x_for(i):
+            return (i / (n - 1)) * w
+
+        def y_for(v):
+            return pad_v + ((v - v_min) / v_range) * (h - 2 * pad_v)
+
+        # Determine line + fill color from severity.
+        _, color = _severity_sf_symbol(self._severity)
+        line_color = color
+        fill_color = color.colorWithAlphaComponent_(0.25)
+
+        # Build the closed fill path first (under the line).
+        fill_path = NSBezierPath.bezierPath()
+        fill_path.moveToPoint_((x_for(0), 0.0))
+        for i, (_, v) in enumerate(samples):
+            fill_path.lineToPoint_((x_for(i), y_for(v)))
+        fill_path.lineToPoint_((x_for(n - 1), 0.0))
+        fill_path.closePath()
+        fill_color.setFill()
+        fill_path.fill()
+
+        # Draw the line on top.
+        line_path = NSBezierPath.bezierPath()
+        line_path.setLineWidth_(1.5)
+        line_path.moveToPoint_((x_for(0), y_for(samples[0][1])))
+        for i, (_, v) in enumerate(samples[1:], 1):
+            line_path.lineToPoint_((x_for(i), y_for(v)))
+        line_color.setStroke()
+        line_path.stroke()
+
+
+# --- HeatGaugeView ---
+
+class HeatGaugeView(NSView):
+    """Colored gauge bar — fraction of bar_max rendered with heat-scale fill.
+
+    The view has a subtle gray track with a rounded-rect colored fill
+    scaled to `fraction` (0.0–1.0). Color interpolates blue→orange→red."""
+
+    def initWithFrame_(self, frame):  # noqa: N802
+        self = objc.super(HeatGaugeView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._fraction: float = 0.0
+        return self
+
+    def setFraction_(self, fraction):  # noqa: N802
+        self._fraction = max(0.0, min(1.0, float(fraction)))
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, dirty_rect):  # noqa: N802
+        bounds = self.bounds()
+        w = bounds.size.width
+        h = bounds.size.height
+        radius = 2.0
+
+        # Gray track.
+        track_color = NSColor.tertiaryLabelColor().colorWithAlphaComponent_(0.2)
+        track_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, radius, radius
+        )
+        track_color.setFill()
+        track_path.fill()
+
+        # Colored fill.
+        fill_w = max(0.0, self._fraction * w)
+        if fill_w > 0:
+            fill_rect = NSMakeRect(0.0, 0.0, fill_w, h)
+            # Clip to rounded track.
+            clip_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                bounds, radius, radius
+            )
+            clip_path.addClip()
+            fill_color = _heat_color(self._fraction)
+            fill_color.setFill()
+            NSBezierPath.fillRect_(fill_rect)
+
+
+# --- RichRowView ---
+
+# Fixed column widths (pts) — keep columns aligned across all rows.
+_COL_SEV_W = 16.0     # severity glyph image view width
+_COL_ICON_W = 20.0    # process icon image view width
+_COL_NAME_W = 150.0   # process name label
+_COL_SPARK_W = 80.0   # sparkline
+_COL_GAUGE_W = 60.0   # heat gauge
+_COL_CPU_W = 52.0     # CPU% label
+_ROW_H = 24.0         # row height
+_ROW_PAD_H = 4.0      # top/bottom internal padding (gives 16 pt inner height)
+_COL_SPACING = 5.0    # gap between columns
+
+
+class RichRowView(NSView):
+    """Composite NSView row: severity glyph | process icon | name label |
+    sparkline | heat gauge | CPU% label.
+
+    Created once per row slot; updated in place per tick via update_().
+    Carries the per-row PID/name and builds the context menu on right-click."""
+
+    def initWithFrame_(self, frame):  # noqa: N802
+        self = objc.super(RichRowView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._pid: Optional[int] = None
+        self._name: str = ""
+        self._app = None
+        self._build_subviews()
+        return self
+
+    def _build_subviews(self):
+        """Construct all subviews and position them with fixed frames.
+        We use manual frame layout (no Auto Layout) because every column
+        has a known fixed width — this avoids constraint churn on every tick."""
+        h = _ROW_H
+        inner_h = h - 2 * _ROW_PAD_H
+        y = _ROW_PAD_H  # baseline for inner content
+
+        x = _COL_SPACING
+
+        # 1. Severity glyph image view.
+        sev_frame = NSMakeRect(x, (h - inner_h) / 2.0, _COL_SEV_W, inner_h)
+        self._sev_view = NSImageView.alloc().initWithFrame_(sev_frame)
+        self._sev_view.setImageScaling_(NSImageScaleProportionallyDown)
+        self.addSubview_(self._sev_view)
+        x += _COL_SEV_W + _COL_SPACING
+
+        # 2. Process icon image view.
+        icon_frame = NSMakeRect(x, (h - inner_h) / 2.0, _COL_ICON_W, inner_h)
+        self._icon_view = NSImageView.alloc().initWithFrame_(icon_frame)
+        self._icon_view.setImageScaling_(NSImageScaleProportionallyDown)
+        self.addSubview_(self._icon_view)
+        x += _COL_ICON_W + _COL_SPACING
+
+        # 3. Process name label.
+        name_frame = NSMakeRect(x, y, _COL_NAME_W, inner_h)
+        self._name_field = NSTextField.alloc().initWithFrame_(name_frame)
+        self._name_field.setBezeled_(False)
+        self._name_field.setDrawsBackground_(False)
+        self._name_field.setEditable_(False)
+        self._name_field.setSelectable_(False)
+        self._name_field.setFont_(
+            NSFont.systemFontOfSize_weight_(12.0, NSFontWeightMedium)
+        )
+        self._name_field.setLineBreakMode_(4)  # NSLineBreakByTruncatingTail = 4
+        self._name_field.setStringValue_("")
+        self.addSubview_(self._name_field)
+        x += _COL_NAME_W + _COL_SPACING
+
+        # 4. Sparkline.
+        spark_frame = NSMakeRect(x, y, _COL_SPARK_W, inner_h)
+        self._spark_view = SparklineView.alloc().initWithFrame_(spark_frame)
+        self.addSubview_(self._spark_view)
+        x += _COL_SPARK_W + _COL_SPACING
+
+        # 5. Heat gauge.
+        gauge_h = 8.0
+        gauge_frame = NSMakeRect(
+            x, y + (inner_h - gauge_h) / 2.0, _COL_GAUGE_W, gauge_h
+        )
+        self._gauge_view = HeatGaugeView.alloc().initWithFrame_(gauge_frame)
+        self.addSubview_(self._gauge_view)
+        x += _COL_GAUGE_W + _COL_SPACING
+
+        # 6. CPU% label (right-aligned, fixed width).
+        cpu_frame = NSMakeRect(x, y, _COL_CPU_W, inner_h)
+        self._cpu_field = NSTextField.alloc().initWithFrame_(cpu_frame)
+        self._cpu_field.setBezeled_(False)
+        self._cpu_field.setDrawsBackground_(False)
+        self._cpu_field.setEditable_(False)
+        self._cpu_field.setSelectable_(False)
+        self._cpu_field.setFont_(NSFont.systemFontOfSize_(11.0))
+        self._cpu_field.setAlignment_(2)  # NSTextAlignmentRight = 2
+        self._cpu_field.setStringValue_("")
+        self.addSubview_(self._cpu_field)
+
+    def setApp_(self, app):  # noqa: N802
+        self._app = app
+
+    def update_(self, row_data, bar_context, pid_history, pid_severity):  # noqa: N802
+        """Mutate all subviews to reflect new row data.
+
+        row_data   — 7-tuple (forks_n, threads_n, pid, pcpu, stat, name, acc_cpu)
+        bar_context — {bar_max, name_width}
+        pid_history — dict[pid, deque[(ts, forks_n)]]  (from app.pid_history)
+        pid_severity — dict[pid, str]  (from app.pid_severity)
+        """
+        forks_n, threads_n, pid, pcpu, stat, name, acc_cpu = row_data
+        bar_max = bar_context["bar_max"]
+        severity = pid_severity.get(pid, "cold")
+
+        # Update per-row identity for context menu.
+        old_pid = self._pid
+        self._pid = pid
+        self._name = name
+
+        # 1. Severity glyph — rebuild if severity changed.
+        sev_img = _make_severity_image(severity)
+        self._sev_view.setImage_(sev_img)
+
+        # 2. Process icon — only resolve/update when PID changes.
+        if pid != old_pid:
+            icon = _resolve_pid_icon(pid)
+            self._icon_view.setImage_(icon)
+
+        # 3. Name label.
+        self._name_field.setStringValue_(name)
+
+        # 4. Sparkline — pass last N samples from pid_history.
+        hist = pid_history.get(pid, [])
+        self._spark_view.setSamples_severity_(list(hist), severity)
+
+        # 5. Heat gauge — log-scaled fraction matching bar() logic.
+        import math
+        bar_value = acc_cpu if (self._app is not None and self._app.sort_by == "cpu") else float(forks_n)
+        if bar_max > 0 and bar_value > 0:
+            fraction = math.log10(bar_value + 1) / math.log10(bar_max + 1)
+            fraction = max(0.0, min(1.0, fraction))
+        else:
+            fraction = 0.0
+        self._gauge_view.setFraction_(fraction)
+
+        # 6. CPU% label.
+        self._cpu_field.setStringValue_(f"{acc_cpu:.1f}%")
+
+    # ----- right-click context menu -----
+
+    def menuForEvent_(self, _event):  # noqa: N802
+        if self._app is None or self._pid is None:
+            return None
+        return self._app._build_row_context_menu(self._pid, self._name)
 
 
 _STAT_PRIMARY = {
@@ -1252,19 +1653,23 @@ class WatchForksApp(rumps.App):
     def _create_row_view(self, row_data, bar_context):
         """Construct a row view from a snapshot tuple.
 
-        Phase 2: return a monospaced NSTextField (subclass with right-click
-        context menu support — see _PlaceholderRowView). Phase 3 will
-        replace this with a rich composite view; the (row_data, bar_context)
-        contract stays the same so the app's tick loop is unchanged."""
-        view = _PlaceholderRowView.alloc().initFrame_(NSMakeRect(0.0, 0.0, POPOVER_WIDTH - 30.0, 18.0))
-        view.setBezeled_(False)
-        view.setDrawsBackground_(False)
-        view.setEditable_(False)
-        view.setSelectable_(False)
-        view.setFont_(_MONO_FONT)
-        view.setStringValue_("")
-        # If we have data right now, populate immediately so the view isn't
-        # blank during the moment between create and the next update.
+        Phase 3: returns a RichRowView — composite NSView with severity
+        glyph, process icon, name label, sparkline, heat gauge, and CPU%
+        label. The (row_data, bar_context) contract is unchanged so the
+        app's tick loop needs no modification."""
+        total_w = (
+            _COL_SPACING
+            + _COL_SEV_W + _COL_SPACING
+            + _COL_ICON_W + _COL_SPACING
+            + _COL_NAME_W + _COL_SPACING
+            + _COL_SPARK_W + _COL_SPACING
+            + _COL_GAUGE_W + _COL_SPACING
+            + _COL_CPU_W + _COL_SPACING
+        )
+        view = RichRowView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, total_w, _ROW_H))
+        view.setApp_(self)
+        # Populate immediately if data is available so the view is never
+        # blank between creation and the first tick update.
         if row_data is not None and bar_context is not None:
             self._update_row_view(view, row_data, bar_context)
         return view
@@ -1272,31 +1677,28 @@ class WatchForksApp(rumps.App):
     def _update_row_view(self, view, row_data, bar_context):
         """Mutate the row view's display to reflect new data.
 
-        Phase 2: rewrite the NSTextField's stringValue and rebind the
-        per-row identity (pid, name) so the right-click context menu
-        targets the right process. Phase 3 will update subviews instead."""
-        forks_n, threads_n, pid, pcpu, stat, name, acc_cpu = row_data
-        bar_max = bar_context["bar_max"]
-        name_width = bar_context["name_width"]
-        # Bar value tracks the active sort dimension so the gauge stays
-        # visually aligned with whichever number is driving the order.
-        bar_value = acc_cpu if self.sort_by == "cpu" else float(forks_n)
-        # bar() is integer-valued; coerce both sides into ints scaled up
-        # so fractional CPU values still rank correctly on the log curve.
-        bar_str = bar(int(bar_value * 10), int(max(bar_max, 0.1) * 10), width=8)
-        row_emoji = SEV_BY_STATE[self.pid_severity.get(pid, "cold")]
-        # Single space between every column — tighter than the legacy
-        # 2-space layout. width-3 right-justification on forks covers up
-        # to 999 (launchd tops out around 800 in steady state); the bar
-        # is fixed-width so the CPU and name columns still align.
-        display = (
-            f"{row_emoji} {forks_n:>3} {bar_str} "
-            f"{acc_cpu:>6.1f}%  {fmt_name(name, name_width)}"
-        )
-        view.setStringValue_(display)
-        # Update the per-row identity so the context menu targets this PID.
-        if isinstance(view, _PlaceholderRowView):
-            view.setRowApp_pid_name_(self, pid, name)
+        Phase 3: delegates to RichRowView.update_() which updates all
+        subviews (severity image, process icon, name, sparkline, gauge,
+        CPU label) in place — no views are destroyed or recreated."""
+        if isinstance(view, RichRowView):
+            view.update_(row_data, bar_context, self.pid_history, self.pid_severity)
+        else:
+            # Fallback for any non-RichRowView (shouldn't happen in Phase 3,
+            # but keeps the app alive if the view pool is in a mixed state).
+            forks_n, threads_n, pid, pcpu, stat, name, acc_cpu = row_data
+            bar_max = bar_context["bar_max"]
+            name_width = bar_context["name_width"]
+            bar_value = acc_cpu if self.sort_by == "cpu" else float(forks_n)
+            bar_str = bar(int(bar_value * 10), int(max(bar_max, 0.1) * 10), width=8)
+            row_emoji = SEV_BY_STATE[self.pid_severity.get(pid, "cold")]
+            display = (
+                f"{row_emoji} {forks_n:>3} {bar_str} "
+                f"{acc_cpu:>6.1f}%  {fmt_name(name, name_width)}"
+            )
+            if hasattr(view, "setStringValue_"):
+                view.setStringValue_(display)
+            if isinstance(view, _PlaceholderRowView):
+                view.setRowApp_pid_name_(self, pid, name)
 
     def _create_header_view(self, launchd_data):
         """Construct the header view from a launchd snapshot tuple.
