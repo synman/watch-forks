@@ -1,0 +1,1083 @@
+#!/usr/bin/env python3
+"""watch-forks-menubar — macOS menu bar widget for live fork counts.
+
+Polls the same ps surfaces as ~/bin/watch-forks (via importlib reuse), shows
+the top fork count + total CPU in the menu bar, and renders the top-N
+offenders in the dropdown. Each offender opens a submenu with PID/CPU/STAT
+details plus SIGTERM and SIGKILL actions (with confirm dialog).
+
+Persisted settings: interval, top N, and pause state are stored in
+  ~/Library/Application Support/watch-forks-menubar/settings.json
+and reloaded at launch.
+
+Live-updates while the dropdown is open: the timer is scheduled in
+NSRunLoopCommonModes (so it fires during NSEventTrackingRunLoopMode menu
+tracking), and a fixed pool of NSMenuItem rows is mutated in place each
+tick — never cleared — so the open menu stays open and just refreshes.
+
+Launch:  ~/bin/watch-forks-menubar &
+Quit:    menu → Quit (or pkill -f watch-forks-menubar)
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import logging
+import logging.handlers
+import os
+import platform
+import signal
+import subprocess
+import sys
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Optional
+
+if platform.system() != "Darwin":
+    sys.stderr.write("watch-forks-menubar: macOS-only\n")
+    sys.exit(2)
+
+import objc
+import rumps
+from AppKit import (
+    NSAlert,
+    NSAttributedString,
+    NSApp,
+    NSFloatingWindowLevel,
+    NSFont,
+    NSFontAttributeName,
+)
+from Foundation import (
+    NSObject,
+    NSRunLoop,
+    NSRunLoopCommonModes,
+    NSTimer,
+)
+
+# NSAlert.runModal() return constants
+NS_ALERT_FIRST = 1000
+NS_ALERT_SECOND = 1001
+
+
+def floating_alert(
+    title: str, message: str = "", ok: str = "OK", cancel: Optional[str] = None
+) -> int:
+    """rumps.alert replacement that always comes up on top.
+
+    Two tricks combine: NSApp.activateIgnoringOtherApps_(True) brings the
+    menubar app to the front so its modal is positioned correctly, and
+    setting the alert window's level to NSFloatingWindowLevel ensures it
+    stays above other apps' regular windows even if focus shifts.
+
+    Returns 1 for the first button (`ok`), 0 for the second (`cancel`),
+    matching the rumps.alert convention this replaces.
+    """
+    NSApp.activateIgnoringOtherApps_(True)
+    alert = NSAlert.alloc().init()
+    alert.setMessageText_(title)
+    if message:
+        alert.setInformativeText_(message)
+    alert.addButtonWithTitle_(ok)
+    if cancel:
+        alert.addButtonWithTitle_(cancel)
+    # layout() forces the panel to be created so we can reach its window.
+    alert.layout()
+    win = alert.window()
+    if win is not None:
+        win.setLevel_(NSFloatingWindowLevel)
+    response = alert.runModal()
+    return 1 if response == NS_ALERT_FIRST else 0
+
+# Find watch-forks alongside this script first (typical for a fresh clone),
+# then fall back to ~/bin/watch-forks (typical when the user symlinks both
+# scripts into ~/bin). Path(__file__).resolve() follows symlinks, so symlinked
+# launches still resolve back to the cloned repo dir where both files live.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+for _candidate in (_SCRIPT_DIR / "watch-forks", Path.home() / "bin" / "watch-forks"):
+    if _candidate.exists():
+        WATCH_FORKS_PATH = _candidate
+        break
+else:
+    sys.stderr.write(
+        "watch-forks-menubar: cannot locate companion 'watch-forks' script\n"
+        f"  searched: {_SCRIPT_DIR / 'watch-forks'}, "
+        f"{Path.home() / 'bin' / 'watch-forks'}\n"
+    )
+    sys.exit(2)
+# watch-forks has no .py extension, so spec_from_file_location returns None;
+# use SourceFileLoader directly.
+_loader = importlib.machinery.SourceFileLoader("watch_forks", str(WATCH_FORKS_PATH))
+_spec = importlib.util.spec_from_loader("watch_forks", _loader)
+_wf = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_wf)
+
+# 0.0 is the "manual" sentinel — no timer scheduled, refresh only when the
+# operator picks "Refresh now". Everything else is the timer interval in
+# seconds. The sentinel must compare-equal to 0.0 after JSON round-trip,
+# which int(0) and float(0.0) both do.
+MANUAL_INTERVAL = 0.0
+INTERVAL_CHOICES = [MANUAL_INTERVAL, 1.0, 2.0, 5.0, 10.0, 30.0]
+TOP_CHOICES = [5, 10, 15, 20, 25, 50]
+# (internal key, display label) — internal key is what's persisted.
+SORT_CHOICES = [("forks", "Forks"), ("cpu", "CPU%")]
+DEFAULT_INTERVAL = 5.0
+DEFAULT_TOP = 15
+DEFAULT_SORT = "forks"
+MAX_TOP = max(TOP_CHOICES)  # pool size for the row item array
+
+
+def interval_label(sec: float) -> str:
+    """Display label for an interval choice — "Manual" for the 0.0 sentinel,
+    "Ns" otherwise. Used as both the menu item title and the radio key."""
+    return "Manual" if sec <= 0 else f"{sec:g}s"
+
+
+def parse_pcpu(s: str) -> float:
+    """ps reports `%CPU` as a string like `12.3`. Coerce to float;
+    malformed values (rare — ps returns `-` for some kernel threads)
+    map to 0.0 so the row still ranks and renders."""
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+SETTINGS_DIR = Path.home() / "Library" / "Application Support" / "watch-forks-menubar"
+SETTINGS_PATH = SETTINGS_DIR / "settings.json"
+
+LOG_DIR = Path.home() / "Library" / "Logs"
+LOG_PATH = LOG_DIR / "watch-forks-menubar.log"
+
+# User LaunchAgent: a plist dropped in ~/Library/LaunchAgents/ is
+# auto-loaded by user launchd at every login, with no manual `launchctl`
+# step needed. We toggle by writing/removing the file — takes effect at
+# next login, which avoids spawning a second instance alongside the
+# manually-launched one that's running right now.
+LAUNCH_AGENT_LABEL = "com.shellware.watch-forks-menubar"
+LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
+LAUNCH_AGENT_PATH = LAUNCH_AGENT_DIR / f"{LAUNCH_AGENT_LABEL}.plist"
+SCRIPT_PATH = str(Path(__file__).resolve())
+
+LAUNCH_AGENT_PLIST = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>{stdout}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr}</string>
+</dict>
+</plist>
+"""
+
+
+def is_login_enabled() -> bool:
+    return LAUNCH_AGENT_PATH.exists()
+
+
+def enable_login() -> bool:
+    try:
+        LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        LAUNCH_AGENT_PATH.write_text(
+            LAUNCH_AGENT_PLIST.format(
+                label=LAUNCH_AGENT_LABEL,
+                program=SCRIPT_PATH,
+                stdout=str(LOG_DIR / "watch-forks-menubar.stdout.log"),
+                stderr=str(LOG_DIR / "watch-forks-menubar.stderr.log"),
+            )
+        )
+        log.info("login agent installed: %s", LAUNCH_AGENT_PATH)
+        return True
+    except OSError as e:
+        log.error("login agent install failed: %s", e)
+        return False
+
+
+def disable_login() -> bool:
+    try:
+        if LAUNCH_AGENT_PATH.exists():
+            LAUNCH_AGENT_PATH.unlink()
+            log.info("login agent removed: %s", LAUNCH_AGENT_PATH)
+        return True
+    except OSError as e:
+        log.error("login agent remove failed: %s", e)
+        return False
+
+
+def _setup_logging() -> logging.Logger:
+    """File logger at ~/Library/Logs/watch-forks-menubar.log — rotates at
+    5 MB × 3 backups so it can't fill the disk. INFO for lifecycle, DEBUG
+    for per-tick state churn, ERROR for caught exceptions. The console
+    handler stays at WARNING so a foreground launch isn't spammed."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("watch-forks-menubar")
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
+log = _setup_logging()
+
+# Title color is plain text; emoji prefix encodes severity.
+SEV_NORMAL = "❄️"  # ❄️ — steady state
+SEV_WARN = "🌡️"   # 🌡️ — rising
+SEV_HOT = "🔥"     # 🔥 — fork-bomb territory
+
+
+# Severity is rate-based with hysteresis, not absolute. The icon reflects
+# the rolling expansion/compaction rate of the total process count (procs/s,
+# smoothed over RATE_WINDOW_SECONDS), and is sticky — it only flips on a
+# rise or fall transition crossing the asymmetric thresholds below.
+#
+#   cold (❄️) ──[rate ≥ RATE_WARM_ENTRY]──▶ warm (🌡️)
+#   warm (🌡️) ──[rate ≥ RATE_HOT_ENTRY ]──▶ hot  (🔥)
+#   warm (🌡️) ──[rate ≤ RATE_COOL_ENTRY]──▶ cold (❄️)
+#   hot  (🔥) ──[rate < RATE_HOT_ENTRY ]──▶ warm (🌡️)
+#
+# A flatline (rate ≈ 0) holds the current state; only a real rise/fall
+# event crosses a threshold. hot never drops directly to cold — it has to
+# cool through warm, which prevents flapping on a single quiet sample.
+RATE_WINDOW_SECONDS = 30.0
+RATE_WARM_ENTRY = 1.0   # ≥ +1 proc/s sustained → warming
+RATE_HOT_ENTRY = 5.0    # ≥ +5 proc/s sustained → hot
+RATE_COOL_ENTRY = 0.0   # ≤ 0 proc/s (flatline or compaction) → cools warm→cold
+
+# Per-process thresholds — same state machine, scaled smaller since per-PID
+# fork counts are typically single-digit. A normal process's children
+# fluctuate by < 0.5/s; a fork bomb pushes well past 2/s.
+PROC_WARM_ENTRY = 0.5
+PROC_HOT_ENTRY = 2.0
+PROC_COOL_ENTRY = 0.0
+
+# State → emoji lookup, shared by the menu-bar title and per-row prefix.
+SEV_BY_STATE = {"cold": SEV_NORMAL, "warm": SEV_WARN, "hot": SEV_HOT}
+
+# CPU trend indicator — direct delta (current_total_cpu - prior_total_cpu),
+# rendered after the % in the title. Asymmetric hysteresis: entry needs a
+# clear trend (≥ ±CPU_TREND_ENTRY) but exit needs a real reversal of at
+# least CPU_TREND_EXIT in the opposite direction. Flat or sub-threshold
+# samples leave the current state alone, so the icon doesn't flap on
+# ps reporting jitter (±1-2% per sample is normal).
+CPU_TREND_ENTRY = 3.0  # %CPU delta to enter rising/falling from steady
+CPU_TREND_EXIT = 1.0   # %CPU opposite-direction delta to drop back to steady
+TREND_RISING = "↑"
+TREND_FALLING = "↓"
+TREND_STEADY = "→"
+TREND_BY_STATE = {
+    "rising": TREND_RISING,
+    "falling": TREND_FALLING,
+    "steady": TREND_STEADY,
+}
+
+
+def cpu_trend_state(
+    prev: str, delta: float, entry_threshold: float, exit_threshold: float
+) -> str:
+    """Signed 3-state trend: rising / steady / falling with asymmetric
+    hysteresis. From steady, the delta must clear ±entry_threshold to
+    enter rising or falling. Once trending, it stays there until the
+    delta reverses by at least exit_threshold in the opposite direction —
+    so a flat or noisy sample preserves the trend, and only a real
+    reversal flips it back to steady."""
+    if prev == "rising":
+        return "steady" if delta <= -exit_threshold else "rising"
+    if prev == "falling":
+        return "steady" if delta >= exit_threshold else "falling"
+    # steady
+    if delta >= entry_threshold:
+        return "rising"
+    if delta <= -entry_threshold:
+        return "falling"
+    return "steady"
+
+
+def apply_hysteresis(
+    prev: str, rate: float, warm_entry: float, hot_entry: float, cool_entry: float
+) -> str:
+    """Sticky 3-state machine driven by rate. Only crosses on the entry
+    threshold for the next state — flatline holds the current state.
+    hot never falls directly to cold; it has to cool through warm."""
+    if prev == "cold" and rate >= warm_entry:
+        return "warm"
+    if prev == "warm":
+        if rate >= hot_entry:
+            return "hot"
+        if rate <= cool_entry:
+            return "cold"
+    if prev == "hot" and rate < hot_entry:
+        return "warm"
+    return prev
+
+
+def compute_rate(history: "deque[tuple[float, int]]", current_value: int, now: float) -> float:
+    """Smoothed rate (units/sec) — uses (current_value - oldest_value) /
+    (now - oldest_timestamp), which damps single-sample noise more than
+    just diffing consecutive ticks."""
+    if not history:
+        return 0.0
+    t0, n0 = history[0]
+    dt = now - t0
+    if dt <= 0:
+        return 0.0
+    return (current_value - n0) / dt
+
+
+# Mono font for menu items — see set_mono_title below.
+_MONO_FONT = NSFont.monospacedSystemFontOfSize_weight_(13.0, 0)
+_MONO_ATTRS = {NSFontAttributeName: _MONO_FONT}
+
+
+def set_mono_title(item: rumps.MenuItem, text: str) -> None:
+    """Render the menu item title in monospaced San Francisco for real
+    column alignment — the regular menu font is proportional, so plain
+    string padding never lines up."""
+    attr = NSAttributedString.alloc().initWithString_attributes_(text, _MONO_ATTRS)
+    item._menuitem.setAttributedTitle_(attr)
+
+
+_BAR_FULL = "█"
+# Empty-cell glyph is plain space, not U+2591 LIGHT SHADE — light-shade
+# renders as a noisy gradient that competes with the filled blocks, and
+# makes zero-value rows look "broken" (8 dim cells reads as artifact, not
+# as zero). Spaces give a crisp filled-vs-blank contrast and let 0-value
+# rows render as a completely empty slot.
+_BAR_EMPTY = " "
+
+
+def bar(value: int, max_value: int, width: int = 8) -> str:
+    """Discrete log-scaled gauge — full block for filled cells, light
+    shade for empty cells. Discrete (no partial-height blocks) so the
+    bar renders as a clean rectangle in NSMenu's mono font; partial
+    blocks like ▁▂▃ sit at the bottom of the cell and read as visual
+    artifacts. A non-zero value always lights at least one cell so the
+    smallest forkers stay visible."""
+    import math
+
+    if max_value <= 0 or value <= 0:
+        return _BAR_EMPTY * width
+    frac = math.log10(value + 1) / math.log10(max_value + 1)
+    filled = max(1, min(width, round(frac * width)))
+    return _BAR_FULL * filled + _BAR_EMPTY * (width - filled)
+
+
+_STAT_PRIMARY = {
+    "I": "Idle",
+    "R": "Running",
+    "S": "Sleeping",
+    "T": "Stopped",
+    "U": "Uninterruptible wait",
+    "Z": "Zombie",
+}
+_STAT_MODIFIER = {
+    "+": "foreground",
+    "<": "high priority",
+    ">": "low priority",
+    "E": "exiting",
+    "L": "pages locked",
+    "N": "niced",
+    "s": "session leader",
+    "W": "swapped",
+    "X": "traced",
+}
+
+
+def decode_stat(stat: str) -> str:
+    """Translate a BSD-style ps STAT string (e.g. `Ss`, `S+`, `S<s`) into
+    human-readable form: primary state, then comma-separated modifiers."""
+    if not stat:
+        return ""
+    primary = _STAT_PRIMARY.get(stat[0], stat[0])
+    mods = [_STAT_MODIFIER[c] for c in stat[1:] if c in _STAT_MODIFIER]
+    if not mods:
+        return primary
+    return f"{primary}, {', '.join(mods)}"
+
+
+def fmt_name(name: str, width: int = 24) -> str:
+    if len(name) <= width:
+        return name.ljust(width)
+    return name[: width - 1] + "..."
+
+
+def compute_accumulated_pcpu(procs: list[dict]) -> dict[int, float]:
+    """Subtree-accumulated CPU% per PID — each process's own pcpu plus
+    the recursive sum of all descendants. Computed iteratively (no
+    recursion) so deep trees can't blow the stack.
+
+    The root's accumulated value approaches the menubar's total CPU
+    figure by construction: launchd (PID 1) is the ancestor of every
+    other user process on macOS, so its subtree sum ≈ Σ all pcpu."""
+    children: dict[int, list[int]] = defaultdict(list)
+    self_pcpu: dict[int, float] = {}
+    for row in procs:
+        self_pcpu[row["pid"]] = parse_pcpu(row["pcpu"])
+        children[row["ppid"]].append(row["pid"])
+
+    # Top-down traversal from roots (PIDs whose ppid isn't in the snap).
+    pid_set = set(self_pcpu.keys())
+    roots = [row["pid"] for row in procs if row["ppid"] not in pid_set]
+    order: list[int] = []
+    stack = list(roots)
+    while stack:
+        pid = stack.pop()
+        order.append(pid)
+        stack.extend(children.get(pid, ()))
+
+    # Bottom-up accumulation — children feed parents.
+    acc = dict(self_pcpu)
+    for pid in reversed(order):
+        for child in children.get(pid, ()):
+            acc[pid] = acc.get(pid, 0.0) + acc.get(child, 0.0)
+    return acc
+
+
+# --- settings persistence ---
+
+def load_settings() -> dict:
+    """Read user settings from disk. Missing/corrupt file → empty dict
+    (caller falls back to defaults)."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            log.info("settings loaded: %s", data)
+            return data
+    except FileNotFoundError:
+        log.info("settings: no file yet at %s", SETTINGS_PATH)
+    except (OSError, json.JSONDecodeError) as e:
+        log.error("settings load failed: %s", e)
+    return {}
+
+
+def save_settings(data: dict) -> None:
+    """Atomic write to ~/Library/Application Support/watch-forks-menubar/
+    settings.json — tempfile + rename so a crashed write can't truncate
+    the existing file."""
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_PATH.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(SETTINGS_PATH)
+        log.info("settings saved: %s", data)
+    except OSError as e:
+        log.error("settings save failed: %s", e)
+
+
+# --- timer driver (NSTimer in NSRunLoopCommonModes) ---
+
+class _TickHandler(NSObject):
+    """Lightweight NSObject so we can target/selector an NSTimer at a
+    Python method. Required because NSTimer needs an Objective-C target;
+    rumps' built-in Timer doesn't expose hooks for the run-loop mode."""
+
+    def initWithApp_(self, app):
+        self = objc.super(_TickHandler, self).init()
+        if self is None:
+            return None
+        self.app = app
+        return self
+
+    def fire_(self, _timer):  # noqa: N802 — ObjC selector naming
+        try:
+            self.app._tick()
+        except Exception:  # don't let a transient error kill the timer
+            log.exception("tick failed")
+
+
+class WatchForksApp(rumps.App):
+    def __init__(self) -> None:
+        super().__init__("watch-forks", title="…", quit_button=None)
+        log.info("=" * 60)
+        log.info("watch-forks-menubar starting (pid=%d)", os.getpid())
+
+        # Load persisted settings; coerce values to the offered choice
+        # lists so a stale settings file doesn't break the radio state.
+        settings = load_settings()
+        self.interval = (
+            settings.get("interval") if settings.get("interval") in INTERVAL_CHOICES
+            else DEFAULT_INTERVAL
+        )
+        self.top = (
+            settings.get("top") if settings.get("top") in TOP_CHOICES else DEFAULT_TOP
+        )
+        valid_sort_keys = {key for key, _ in SORT_CHOICES}
+        self.sort_by = (
+            settings.get("sort_by") if settings.get("sort_by") in valid_sort_keys
+            else DEFAULT_SORT
+        )
+        self._last_snapshot: list[tuple[int, int, int, str, str, str, float]] = []
+        # Rate-based severity state — sticky across ticks; only changes
+        # when the rolling rate crosses a hysteresis threshold.
+        self.severity: str = "cold"
+        self.rate: float = 0.0
+        self.proc_history: deque[tuple[float, int]] = deque()
+        # Per-PID rate state, same machine. Pruned each tick to whatever
+        # PIDs are alive in the current snapshot.
+        self.pid_history: dict[int, deque[tuple[float, int]]] = {}
+        self.pid_severity: dict[int, str] = {}
+        # Signed CPU trend (rising/steady/falling) — current_total_cpu minus
+        # prior sample. last_total_cpu seeds at None so the first tick can't
+        # synthesize a giant delta against zero.
+        self.last_total_cpu: Optional[float] = None
+        self.cpu_trend: str = "steady"
+
+        # Build menu structure once; subsequent ticks mutate items in
+        # place so the menu stays open during refresh.
+        self._build_menu()
+
+        # Initial render BEFORE timer arms — title is non-empty at first display.
+        self._tick()
+
+        # NSTimer in common modes — fires during menu tracking too.
+        self._tick_handler = _TickHandler.alloc().initWithApp_(self)
+        self._ns_timer = None
+        self._reschedule_timer()
+
+    # ----- menu construction (once) -----
+
+    def _build_menu(self) -> None:
+        """Build the entire menu structure once. _tick() mutates items
+        in place; clear()+rebuild would close the menu mid-open."""
+        # Header — current/max processes
+        self.header_item = rumps.MenuItem("…")
+        self.header_item.set_callback(None)
+        self.menu.add(self.header_item)
+        self.menu.add(rumps.separator)
+
+        # Pool of MAX_TOP row items, each with its full submenu pre-built.
+        # We mutate titles / callbacks per tick; rows beyond self.top get
+        # hidden via NSMenuItem.setHidden_.
+        self.row_items: list[rumps.MenuItem] = []
+        self.row_state: list[Optional[int]] = []  # PID currently shown per slot
+        for i in range(MAX_TOP):
+            row = rumps.MenuItem(f"_row_slot_{i}")
+            # Disabled-detail lines + action items, pre-allocated.
+            for key in (
+                "pid_line", "forks_line", "threads_ln",
+                "cpu_self_line", "cpu_tree_line", "state_line",
+            ):
+                it = rumps.MenuItem(key)
+                it.set_callback(None)
+                row[key] = it
+            row["sep1"] = rumps.separator
+            # Action items get their callbacks rebound each tick (PID changes).
+            row["Copy PID"] = rumps.MenuItem("Copy PID", callback=lambda _s: None)
+            row["Show in Activity Monitor"] = rumps.MenuItem(
+                "Show in Activity Monitor", callback=lambda _s: None
+            )
+            row["sep2"] = rumps.separator
+            row["Send SIGTERM (15)"] = rumps.MenuItem(
+                "Send SIGTERM (15)", callback=lambda _s: None
+            )
+            row["Send SIGKILL (9)"] = rumps.MenuItem(
+                "Send SIGKILL (9)", callback=lambda _s: None
+            )
+            self.menu.add(row)
+            self.row_items.append(row)
+            self.row_state.append(None)
+
+        # Static tail
+        self.menu.add(rumps.separator)
+        self.refresh_item = rumps.MenuItem(
+            "Refresh now", callback=self._refresh_now, key="r"
+        )
+        self.menu.add(self.refresh_item)
+
+        self.interval_menu = rumps.MenuItem("Interval")
+        for sec in INTERVAL_CHOICES:
+            label = interval_label(sec)
+            it = rumps.MenuItem(label, callback=self._make_set_interval(sec))
+            it.state = 1 if sec == self.interval else 0
+            self.interval_menu[label] = it
+        self.menu.add(self.interval_menu)
+
+        self.top_menu = rumps.MenuItem("Top N")
+        for n in TOP_CHOICES:
+            label = f"{n}"
+            it = rumps.MenuItem(label, callback=self._make_set_top(n))
+            it.state = 1 if n == self.top else 0
+            self.top_menu[label] = it
+        self.menu.add(self.top_menu)
+
+        self.sort_menu = rumps.MenuItem("Sort by")
+        for key, label in SORT_CHOICES:
+            it = rumps.MenuItem(label, callback=self._make_set_sort(key))
+            it.state = 1 if key == self.sort_by else 0
+            self.sort_menu[label] = it
+        self.menu.add(self.sort_menu)
+
+        # No state= here — the top-level menu's state column is suppressed
+        # (see _build_menu's tail), so checkmarks won't render. Convey
+        # toggle state via the title text instead.
+        self.login_item = rumps.MenuItem(
+            self._login_title(), callback=self._toggle_login
+        )
+        self.menu.add(self.login_item)
+
+        self.menu.add(rumps.separator)
+        self.terminal_item = rumps.MenuItem(
+            "Open full table in Terminal…", callback=self._open_terminal
+        )
+        self.menu.add(self.terminal_item)
+        self.menu.add(rumps.separator)
+        self.quit_item = rumps.MenuItem(
+            "Quit watch-forks", callback=rumps.quit_application, key="q"
+        )
+        self.menu.add(self.quit_item)
+
+        # Collapse NSMenu's state-indicator column on the top-level menu so
+        # the rows start flush against the popup's left edge — without this,
+        # NSMenu reserves a fixed gutter for checkmarks/radio dots on every
+        # row even when none are set. Submenus (Interval / Top N / Sort by)
+        # are separate NSMenu instances and keep their state column for
+        # radio rendering. Toggle items in the top-level menu (Hide launchd,
+        # Start at login) convey state via title flip instead of checkmark.
+        ns_menu = getattr(self.menu, "_menu", None)
+        if ns_menu is not None and hasattr(ns_menu, "setShowsStateColumn_"):
+            ns_menu.setShowsStateColumn_(False)
+
+    # ----- data collection (delegate to watch-forks) -----
+
+    def _collect(self) -> list[tuple[int, int, int, str, str, str, float]]:
+        """Return a sorted snapshot of (forks, threads, pid, pcpu_str, stat,
+        name, acc_cpu) per process. acc_cpu is the subtree-accumulated CPU%
+        so launchd's row carries the full tree total (matching the menubar).
+        Sort key is driven by self.sort_by (forks | cpu)."""
+        threads = _wf.collect_threads()
+        ucomm = _wf.collect_ucomm()
+        procs = _wf.collect_procs()
+        tmux_sessions = _wf.collect_tmux_sessions()
+        tmux_suffix = f" ({', '.join(tmux_sessions)})" if tmux_sessions else ""
+        forks: dict[int, int] = defaultdict(int)
+        for row in procs:
+            forks[row["ppid"]] += 1
+        acc_cpu = compute_accumulated_pcpu(procs)
+        out: list[tuple[int, int, int, str, str, str, float]] = []
+        for row in procs:
+            name = _wf.shortname(row["command"], ucomm.get(row["pid"], ""))
+            if name == "tmux" and tmux_suffix:
+                name = "tmux" + tmux_suffix
+            pid = row["pid"]
+            out.append(
+                (
+                    forks[pid],
+                    threads.get(pid, 0),
+                    pid,
+                    row["pcpu"],
+                    row["stat"],
+                    name,
+                    acc_cpu.get(pid, 0.0),
+                )
+            )
+        if self.sort_by == "cpu":
+            out.sort(key=lambda r: (-r[6], -r[0], -r[1], r[2]))
+        else:  # "forks" (default)
+            out.sort(key=lambda r: (-r[0], -r[1], r[2]))
+        return out
+
+    # ----- severity (rate-based, sticky) -----
+
+    @staticmethod
+    def _trim(history: "deque[tuple[float, int]]", now: float) -> None:
+        cutoff = now - RATE_WINDOW_SECONDS
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def _update_global_severity(self, total_procs: int, now: float) -> None:
+        self._trim(self.proc_history, now)
+        self.proc_history.append((now, total_procs))
+        self.rate = compute_rate(self.proc_history, total_procs, now)
+        prev = self.severity
+        self.severity = apply_hysteresis(
+            self.severity, self.rate,
+            RATE_WARM_ENTRY, RATE_HOT_ENTRY, RATE_COOL_ENTRY,
+        )
+        if self.severity != prev:
+            log.info(
+                "global severity transition: %s → %s (rate=%+.2f/s procs=%d)",
+                prev, self.severity, self.rate, total_procs,
+            )
+
+    def _update_pid_severity(
+        self, snap: list[tuple[int, int, int, str, str, str, float]], now: float
+    ) -> None:
+        live_pids = set()
+        for forks_n, _, pid, _, _, name, _ in snap:
+            live_pids.add(pid)
+            hist = self.pid_history.setdefault(pid, deque())
+            self._trim(hist, now)
+            hist.append((now, forks_n))
+            rate = compute_rate(hist, forks_n, now)
+            prev = self.pid_severity.get(pid, "cold")
+            new = apply_hysteresis(
+                prev, rate,
+                PROC_WARM_ENTRY, PROC_HOT_ENTRY, PROC_COOL_ENTRY,
+            )
+            self.pid_severity[pid] = new
+            if new != prev:
+                log.info(
+                    "pid severity transition: %s → %s pid=%d name=%s rate=%+.2f/s forks=%d",
+                    prev, new, pid, name, rate, forks_n,
+                )
+        for pid in list(self.pid_history):
+            if pid not in live_pids:
+                del self.pid_history[pid]
+                self.pid_severity.pop(pid, None)
+
+    # ----- render (mutates existing items in place) -----
+
+    def _tick(self) -> None:
+        try:
+            snap = self._collect()
+        except subprocess.CalledProcessError:
+            self.title = "⚠️ ps?"
+            return
+        self._last_snapshot = snap
+        now = time.time()
+        total_procs = len(snap)
+        self._update_global_severity(total_procs, now)
+        self._update_pid_severity(snap, now)
+
+        # Title — emoji · total procs · summed CPU% · trend.
+        # Σ pcpu over every row = system-wide CPU%. By construction
+        # this equals the root's subtree-accumulated value (launchd
+        # is ancestor of every user process), so the top row in the
+        # dropdown carries the same number as the menubar title.
+        total_cpu = 0.0
+        for _, _, _, pcpu, _, _, _ in snap:
+            total_cpu += parse_pcpu(pcpu)
+        emoji = SEV_BY_STATE[self.severity]
+        # CPU trend — sample-to-sample delta with asymmetric hysteresis.
+        # First tick has no prior sample → seed steady and skip the
+        # transition log line.
+        if self.last_total_cpu is None:
+            cpu_delta = 0.0
+        else:
+            cpu_delta = total_cpu - self.last_total_cpu
+        prev_trend = self.cpu_trend
+        self.cpu_trend = cpu_trend_state(
+            prev_trend, cpu_delta, CPU_TREND_ENTRY, CPU_TREND_EXIT,
+        )
+        if self.cpu_trend != prev_trend:
+            log.info(
+                "cpu trend transition: %s → %s (delta=%+.1f%% cpu=%.1f%%)",
+                prev_trend, self.cpu_trend, cpu_delta, total_cpu,
+            )
+        self.last_total_cpu = total_cpu
+        trend_glyph = TREND_BY_STATE[self.cpu_trend]
+        self.title = f"{emoji} {total_procs} / {total_cpu:.0f}% {trend_glyph}"
+
+        # Header — PID 1 (launchd) details. launchd is the ancestor of every
+        # user process on macOS, so its acc_cpu == total system CPU and its
+        # forks count is the per-uid direct-child population. Defensive
+        # fallback to total_procs only on the unlikely event ps omits PID 1.
+        pid1 = next((r for r in snap if r[2] == 1), None)
+        if pid1 is not None:
+            forks_n, threads_n, _, _, _, _, acc_cpu = pid1
+            pid1_emoji = SEV_BY_STATE[self.pid_severity.get(1, "cold")]
+            header_text = (
+                f"{pid1_emoji} launchd · {forks_n} forks · "
+                f"{threads_n} threads · {acc_cpu:.1f}% CPU"
+            )
+        else:
+            header_text = f"launchd · n/a (procs={total_procs})"
+        set_mono_title(self.header_item, header_text)
+
+        # Rows — mutate the pool in place; show first `top`, hide the rest.
+        # Bar value tracks the active sort dimension so the gauge stays
+        # visually aligned with whichever number is driving the order.
+        # PID 1 (launchd) is always filtered out — its data is in the
+        # header above; including it in the rows would distort the bar
+        # scale (its forks/CPU dwarf every other process by orders of
+        # magnitude) and duplicate information.
+        display_snap = [r for r in snap if r[2] != 1]
+        top_n = min(self.top, len(display_snap))
+        if self.sort_by == "cpu":
+            bar_max = display_snap[0][6] if display_snap else 0.0
+        else:
+            bar_max = float(display_snap[0][0]) if display_snap else 0.0
+        name_width = max((len(r[5]) for r in display_snap[:top_n]), default=16)
+        name_width = min(max(name_width, 16), 28)
+
+        for i in range(MAX_TOP):
+            row = self.row_items[i]
+            if i < top_n:
+                forks_n, threads_n, pid, pcpu, stat, name, acc_cpu = display_snap[i]
+                self._populate_row(
+                    row, forks_n, threads_n, pid, pcpu, stat, name, acc_cpu,
+                    bar_max, name_width,
+                )
+                row._menuitem.setHidden_(False)
+                self.row_state[i] = pid
+            else:
+                row._menuitem.setHidden_(True)
+                self.row_state[i] = None
+
+    def _populate_row(
+        self,
+        row: rumps.MenuItem,
+        forks_n: int,
+        threads_n: int,
+        pid: int,
+        pcpu: str,
+        stat: str,
+        name: str,
+        acc_cpu: float,
+        bar_max: float,
+        name_width: int,
+    ) -> None:
+        """Mutate the row's title, submenu detail lines, and action callbacks
+        for a new (pid, name) tuple. Does NOT add or remove items — every
+        slot in the pool was pre-allocated in _build_menu."""
+        # Row layout: emoji · forks · bar · subtree-cpu% · name
+        bar_value = acc_cpu if self.sort_by == "cpu" else float(forks_n)
+        # bar() is integer-valued; coerce both sides into ints scaled up
+        # so fractional CPU values still rank correctly on the log curve.
+        bar_str = bar(int(bar_value * 10), int(max(bar_max, 0.1) * 10), width=8)
+        row_emoji = SEV_BY_STATE[self.pid_severity.get(pid, "cold")]
+        # Single space between every column — tighter than the previous
+        # 2-space layout. width-3 right-justification on forks covers up
+        # to 999 (launchd tops out around 800 in steady state); the bar
+        # is fixed-width so the CPU and name columns still align.
+        display = (
+            f"{row_emoji} {forks_n:>3} {bar_str} "
+            f"{acc_cpu:>6.1f}%  {fmt_name(name, name_width)}"
+        )
+        set_mono_title(row, display)
+
+        # Detail lines (greyed) — split self-CPU from subtree-CPU so the
+        # operator can see both. Σ self-CPU across all rows = menubar
+        # total; subtree-CPU is what the row's CPU column displays.
+        for key, text in (
+            ("pid_line",      f"PID         {pid}"),
+            ("forks_line",    f"Forks       {forks_n}"),
+            ("threads_ln",    f"Threads     {threads_n}"),
+            ("cpu_self_line", f"CPU (self)  {parse_pcpu(pcpu):>5.1f}%"),
+            ("cpu_tree_line", f"CPU (tree)  {acc_cpu:>5.1f}%"),
+            ("state_line",    f"State       {decode_stat(stat)}"),
+        ):
+            set_mono_title(row[key], text)
+
+        # Action callbacks — rebind to current PID/name.
+        row["Copy PID"].set_callback(self._make_copy_pid(pid))
+        row["Show in Activity Monitor"].set_callback(
+            self._make_show_activity_monitor(pid)
+        )
+        row["Send SIGTERM (15)"].set_callback(
+            self._make_kill(pid, name, signal.SIGTERM)
+        )
+        row["Send SIGKILL (9)"].set_callback(
+            self._make_kill(pid, name, signal.SIGKILL)
+        )
+
+    # ----- callbacks -----
+
+    def _refresh_now(self, _sender) -> None:
+        self._tick()
+
+    def _make_set_interval(self, sec: float):
+        target_label = interval_label(sec)
+
+        def _cb(_sender):
+            self.interval = sec
+            self._persist_settings()
+            for label, item in self.interval_menu.items():
+                item.state = 1 if label == target_label else 0
+            self._reschedule_timer()
+            self._tick()
+        return _cb
+
+    def _make_set_top(self, n: int):
+        def _cb(_sender):
+            self.top = n
+            self._persist_settings()
+            for label, item in self.top_menu.items():
+                item.state = 1 if label == f"{n}" else 0
+            self._tick()
+        return _cb
+
+    def _make_set_sort(self, key: str):
+        target_label = next(label for k, label in SORT_CHOICES if k == key)
+
+        def _cb(_sender):
+            self.sort_by = key
+            self._persist_settings()
+            for label, item in self.sort_menu.items():
+                item.state = 1 if label == target_label else 0
+            log.info("sort_by → %s", key)
+            self._tick()
+        return _cb
+
+    def _login_title(self) -> str:
+        return "Disable start at login" if is_login_enabled() else "Start at login"
+
+    def _toggle_login(self, _sender) -> None:
+        if is_login_enabled():
+            ok = disable_login()
+            if ok:
+                self.login_item.title = self._login_title()
+                floating_alert(
+                    title="Start at login disabled",
+                    message=(
+                        "watch-forks-menubar will no longer launch at login.\n\n"
+                        "The currently-running instance is unaffected."
+                    ),
+                )
+        else:
+            ok = enable_login()
+            if ok:
+                self.login_item.title = self._login_title()
+                floating_alert(
+                    title="Start at login enabled",
+                    message=(
+                        "watch-forks-menubar will launch automatically at your "
+                        "next macOS login.\n\n"
+                        f"LaunchAgent: {LAUNCH_AGENT_PATH}"
+                    ),
+                )
+
+    def _make_copy_pid(self, pid: int):
+        def _cb(_sender):
+            subprocess.run(["pbcopy"], input=str(pid), text=True, check=False)
+        return _cb
+
+    def _make_show_activity_monitor(self, pid: int):
+        def _cb(_sender):
+            # AM doesn't accept a PID arg, but opening it is still useful.
+            subprocess.run(["open", "-a", "Activity Monitor"], check=False)
+        return _cb
+
+    def _make_kill(self, pid: int, name: str, sig: int):
+        sig_name = "SIGKILL (-9)" if sig == signal.SIGKILL else "SIGTERM (-15)"
+
+        def _cb(_sender):
+            log.info("kill action invoked: pid=%d name=%s sig=%s", pid, name, sig_name)
+            resp = floating_alert(
+                title=f"Send {sig_name}?",
+                message=f"PID {pid}  ({name})\n\nThis cannot be undone.",
+                ok="Send signal",
+                cancel="Cancel",
+            )
+            if resp != 1:
+                log.info("kill cancelled by operator: pid=%d", pid)
+                return
+            try:
+                os.kill(pid, sig)
+                log.info("os.kill succeeded: pid=%d sig=%s", pid, sig_name)
+            except ProcessLookupError:
+                log.warning("os.kill: no such process pid=%d", pid)
+                floating_alert(title="No such process", message=f"PID {pid}")
+            except PermissionError:
+                log.warning("os.kill permission denied: pid=%d", pid)
+                floating_alert(
+                    title="Permission denied",
+                    message=(
+                        f"Cannot signal PID {pid} ({name}).\n"
+                        "Try running watch-forks-menubar with sudo, or kill\n"
+                        "the process from a privileged shell."
+                    ),
+                )
+            except Exception:
+                log.exception("os.kill failed unexpectedly: pid=%d", pid)
+            # rumps.notification() depends on a bundled Info.plist with
+            # CFBundleIdentifier, which a plain python3 interpreter lacks
+            # — guard so a missing notification center can't abort the
+            # refresh below.
+            try:
+                rumps.notification(
+                    title="watch-forks",
+                    subtitle=f"Sent {sig_name} to {pid}",
+                    message=name,
+                )
+            except Exception as e:
+                log.debug("notification skipped (%s)", type(e).__name__)
+            # Always refresh — even on failure, the user expects the menu
+            # to reflect current reality after the action.
+            try:
+                self._tick()
+            except Exception:
+                log.exception("post-kill tick failed")
+        return _cb
+
+    def _open_terminal(self, _sender) -> None:
+        # `clear &&` wipes the new shell's prompt + command-echo line before
+        # watch-forks paints, so the operator sees a clean table immediately
+        # instead of a half-second flash of "shell$ /path/to/watch-forks ...".
+        # In Manual mode (interval==0) we'd pass -i 0 → tight loop in
+        # watch-forks; fall back to DEFAULT_INTERVAL for the terminal run.
+        term_interval = self.interval if self.interval > 0 else DEFAULT_INTERVAL
+        script = (
+            'tell application "Terminal"\n'
+            '    activate\n'
+            f'    do script "clear && {WATCH_FORKS_PATH} -i {term_interval:g} -n 50"\n'
+            'end tell'
+        )
+        subprocess.run(["osascript", "-e", script], check=False)
+
+    # ----- timer + persistence -----
+
+    def _reschedule_timer(self) -> None:
+        """Invalidate any existing timer and schedule a new one in
+        NSRunLoopCommonModes — this is what makes the menu refresh
+        while open. NSTimer.scheduledTimer... uses default mode only,
+        which is suspended during menu tracking; common modes covers
+        both default AND NSEventTrackingRunLoopMode.
+
+        Manual mode (interval == 0.0) leaves no timer armed — the data
+        only updates when the operator picks "Refresh now"."""
+        if self._ns_timer is not None:
+            self._ns_timer.invalidate()
+            self._ns_timer = None
+        if self.interval <= 0:
+            log.info("timer not scheduled: interval=manual")
+            return
+        self._ns_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            self.interval, self._tick_handler, b"fire:", None, True
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(
+            self._ns_timer, NSRunLoopCommonModes
+        )
+        log.info("timer scheduled: interval=%.1fs (NSRunLoopCommonModes)", self.interval)
+
+    def _persist_settings(self) -> None:
+        save_settings({
+            "interval": self.interval,
+            "top": self.top,
+            "sort_by": self.sort_by,
+        })
+
+
+def main() -> int:
+    WatchForksApp().run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

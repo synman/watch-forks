@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""watch-forks — top fork/thread counters on macOS, refreshed every N seconds.
+
+Polls `ps -eM` (threads), `ps -eo pid,ucomm` (binary name), and
+`ps -eo ppid,pid,pcpu,state,command` (process metadata) every interval,
+groups by parent PID to compute FORKS, sums threads per PID, and prints
+the top-N rows by FORKS desc.
+
+NAME column extraction order:
+  0.  Single-token COMMAND with no `/`        → trust it (setproctitle rewrites,
+                                                e.g. `nginx-worker`)
+  1a. Python interpreter at start of COMMAND  → script basename (or `-m mod`)
+  1b. Bare `npm exec` / `npx` at start        → package name (strip @org/ prefix)
+  1c. Node interpreter at start of COMMAND    → script basename (strip .js/.mjs/.cjs)
+                                                or nested `npm exec`/`npx` package
+  2.  ucomm matches /^[0-9]+\\.[0-9]+/        → COMMAND first-token basename
+                                                (claude installer-versioned-dir quirk)
+  3.  Otherwise                               → ucomm
+                                                (handles "Microsoft Teams" etc.;
+                                                 Darwin kernel caps at 16 chars)
+  4.  Post-process: claude CLI w/ `--name claude-<scope>` → that scope
+
+macOS-only — uses BSD-style `ps -eM` for per-thread output (no Linux equivalent).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+
+# Locate tmux once, with Homebrew paths in the search list so we resolve it
+# even when launched from a LaunchAgent (whose inherited PATH is just
+# /usr/bin:/bin:/usr/sbin:/sbin and excludes /opt/homebrew/bin on Apple
+# Silicon and /usr/local/bin on Intel). None when tmux isn't installed.
+TMUX_BIN = shutil.which(
+    "tmux",
+    path=os.pathsep.join(
+        ("/opt/homebrew/bin", "/usr/local/bin", os.environ.get("PATH", ""))
+    ),
+)
+
+HDR = "\x1b[1;32m"
+RESET = "\x1b[0m"
+CLEAR = "\x1b[2J\x1b[H"  # erase display + home cursor
+
+# Alternate screen buffer — what top/htop/less/vim use. The alt buffer is
+# exactly viewport-sized, doesn't interact with scrollback, and on exit
+# restores the prior terminal contents. Without this, when a frame (header
+# + -n rows) exceeds the terminal's row count, the print scrolls excess
+# lines into scrollback every iteration; \x1b[2J only clears the visible
+# viewport so subsequent frames append into scrollback indefinitely and
+# the header is permanently scrolled off-screen.
+ENTER_ALT_SCREEN = "\x1b[?1049h"
+EXIT_ALT_SCREEN = "\x1b[?1049l"
+HIDE_CURSOR = "\x1b[?25l"
+SHOW_CURSOR = "\x1b[?25h"
+
+PY_INTERP = re.compile(r"^\S*python[0-9.]*\s+")
+PY_DASH_M = re.compile(r"^-m\s+")
+PY_DASH_C = re.compile(r"^-c(\s|$)")
+NODE_INTERP = re.compile(r"^\S*node[0-9.]*\s+")
+NODE_DASH_E = re.compile(r"^-e(\s|$)")
+NPM_EXEC = re.compile(r"^(?:npm\s+exec|npx)\s+(?:@[^/\s]+/)?(\S+)")
+JS_EXTS = (".js", ".mjs", ".cjs")
+VERSION_UCOMM = re.compile(r"^[0-9]+\.[0-9]+")
+CLAUDE_NAME_ARG = re.compile(r"--name\s+(\S+)")
+GENERIC_BASENAMES = {"server", "main", "__main__", "index", "cli"}
+
+
+def _run(cmd: list[str]) -> str:
+    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+
+def collect_tmux_sessions() -> list[str]:
+    """Names of tmux sessions on the current user's default socket. Empty if
+    no server is running or `tmux` is not installed. Best-effort — multi-socket
+    setups only see the default socket's sessions. Resolves the tmux binary
+    via TMUX_BIN so LaunchAgent invocations (minimal PATH) still find it."""
+    if TMUX_BIN is None:
+        return []
+    try:
+        out = subprocess.run(
+            [TMUX_BIN, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, check=False, timeout=2.0,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    return [s for s in out.strip().splitlines() if s]
+
+
+def collect_threads() -> dict[int, int]:
+    """Parse `ps -eM` for per-pid thread counts.
+
+    `ps -eM` lists one row per process followed by one row per additional
+    thread. Process rows have an integer PID in field 2; thread rows have a
+    %CPU decimal (e.g. "0.0") in field 2.
+    """
+    threads: dict[int, int] = defaultdict(int)
+    current_pid: int | None = None
+    for i, line in enumerate(_run(["ps", "-eM"]).splitlines()):
+        if i == 0:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if "." in parts[1]:  # thread row
+            if current_pid is not None:
+                threads[current_pid] += 1
+        else:                # process row
+            try:
+                current_pid = int(parts[1])
+                threads[current_pid] += 1
+            except ValueError:
+                current_pid = None
+    return threads
+
+
+def collect_ucomm() -> dict[int, str]:
+    """Parse `ps -eo pid,ucomm`. ucomm may contain spaces."""
+    ucomm: dict[int, str] = {}
+    for i, line in enumerate(_run(["ps", "-eo", "pid,ucomm"]).splitlines()):
+        if i == 0:
+            continue
+        m = re.match(r"\s*(\d+)\s+(.*)", line)
+        if m:
+            ucomm[int(m.group(1))] = m.group(2).rstrip()
+    return ucomm
+
+
+def collect_procs() -> list[dict]:
+    """Parse `ps -eo ppid,pid,pcpu,state,command`."""
+    rows: list[dict] = []
+    for i, line in enumerate(_run(["ps", "-eo", "ppid,pid,pcpu,state,command"]).splitlines()):
+        if i == 0:
+            continue
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)", line)
+        if m:
+            rows.append({
+                "ppid": int(m.group(1)),
+                "pid": int(m.group(2)),
+                "pcpu": m.group(3),
+                "stat": m.group(4),
+                "command": m.group(5).rstrip(),
+            })
+    return rows
+
+
+def shortname(cmd: str, uc: str) -> str:
+    """Derive a short display name. See module docstring for ordering."""
+    # 0. Single-token COMMAND with no path separator = setproctitle rewrite
+    #    (e.g. nginx-worker). Honor it before any path/python parsing.
+    if cmd and " " not in cmd and "/" not in cmd:
+        return cmd
+    # 1. Python interpreter at start of COMMAND
+    m = PY_INTERP.match(cmd)
+    if m:
+        rest = cmd[m.end():]
+        if PY_DASH_C.match(rest):
+            return "python-c"
+        m2 = PY_DASH_M.match(rest)
+        if m2:
+            rest = rest[m2.end():]
+        first = rest.split(None, 1)[0] if rest else ""
+        if not first:
+            return "python"
+        parts = first.split("/")
+        base = parts[-1]
+        if base.endswith(".py"):
+            base = base[:-3]
+        if base in GENERIC_BASENAMES and len(parts) >= 2:
+            base = parts[-2]
+            if base == "services" and len(parts) >= 3:
+                base = parts[-3]
+        return base
+    # 1b. Bare `npm exec [@org/]pkg` / `npx [@org/]pkg` — npm rewrites argv
+    #     before reaching node, so there's no node prefix to strip
+    nm0 = NPM_EXEC.match(cmd)
+    if nm0:
+        return nm0.group(1)
+    # 1c. Node interpreter at start of COMMAND (mirrors python branch)
+    mn = NODE_INTERP.match(cmd)
+    if mn:
+        rest = cmd[mn.end():]
+        if NODE_DASH_E.match(rest):
+            return "node-e"
+        # `npm exec [@org/]pkg ...` / `npx [@org/]pkg ...` — pkg is what we want
+        nm = NPM_EXEC.match(rest)
+        if nm:
+            return nm.group(1)
+        first = rest.split(None, 1)[0] if rest else ""
+        if not first:
+            return "node"
+        parts = first.split("/")
+        base = parts[-1]
+        for ext in JS_EXTS:
+            if base.endswith(ext):
+                base = base[: -len(ext)]
+                break
+        if base in GENERIC_BASENAMES and len(parts) >= 2:
+            base = parts[-2]
+        return base
+    # 2. ucomm looks version-y → fall back to COMMAND first-token basename
+    if VERSION_UCOMM.match(uc):
+        first = cmd.split(None, 1)[0] if cmd else ""
+        name = first.split("/")[-1] if first else uc
+    else:
+        # 3. Trust ucomm
+        name = uc
+    # 4. Post-process: claude CLI carries `--name claude-<scope>` — surface that
+    if name == "claude":
+        m3 = CLAUDE_NAME_ARG.search(cmd)
+        if m3:
+            return m3.group(1)
+    return name
+
+
+def render(top: int) -> None:
+    threads = collect_threads()
+    ucomm = collect_ucomm()
+    procs = collect_procs()
+    tmux_suffix = ""
+    sessions = collect_tmux_sessions()
+    if sessions:
+        tmux_suffix = f" ({', '.join(sessions)})"
+    forks: dict[int, int] = defaultdict(int)
+    for row in procs:
+        forks[row["ppid"]] += 1
+    rows = []
+    for row in procs:
+        name = shortname(row["command"], ucomm.get(row["pid"], ""))
+        if name == "tmux" and tmux_suffix:
+            name = "tmux" + tmux_suffix
+        rows.append((
+            forks[row["pid"]],
+            threads.get(row["pid"], 0),
+            row["pid"],
+            row["pcpu"],
+            row["stat"],
+            name,
+        ))
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
+    print(CLEAR, end="")
+    print(f'{HDR}{"FORKS":<10} | {"THREADS":<10} | {"PID":<10} | {"CPU%":<6} | {"STAT":<5} | NAME{RESET}')
+    for forks_n, threads_n, pid, pcpu, stat, name in rows[:top]:
+        print(f"{forks_n:<10} | {threads_n:<10} | {pid:<10} | {pcpu:<6} | {stat:<5} | {name}")
+
+
+def main() -> int:
+    if platform.system() != "Darwin":
+        print(f"watch-forks: macOS-only (detected {platform.system()})", file=sys.stderr)
+        return 2
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("-n", "--top", type=int, default=25, help="rows to display (default: 25)")
+    p.add_argument("-i", "--interval", type=float, default=5.0, help="refresh seconds (default: 5)")
+    p.add_argument("--once", action="store_true", help="render once and exit")
+    args = p.parse_args()
+    # Loop mode in an interactive TTY uses the alternate screen buffer so the
+    # in-place refresh works cleanly even when -n exceeds the visible row
+    # count. --once and pipe/redirect cases stay in the normal buffer so
+    # output remains visible after exit (or gets captured intact).
+    use_alt = sys.stdout.isatty() and not args.once
+    try:
+        if use_alt:
+            sys.stdout.write(ENTER_ALT_SCREEN + HIDE_CURSOR)
+            sys.stdout.flush()
+        while True:
+            # In loop mode, cap displayed rows to (terminal_lines - 2) so the
+            # header stays on-screen and the bottom row doesn't trigger a
+            # scroll within the alt buffer. --once and non-TTY want the full
+            # -n rows since the operator can scroll/pipe at their leisure.
+            if use_alt:
+                term_lines = shutil.get_terminal_size((80, 24)).lines
+                effective_top = min(args.top, max(1, term_lines - 2))
+            else:
+                effective_top = args.top
+            render(effective_top)
+            if args.once:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if use_alt:
+            sys.stdout.write(SHOW_CURSOR + EXIT_ALT_SCREEN)
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
