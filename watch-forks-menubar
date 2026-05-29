@@ -1449,7 +1449,14 @@ class WatchForksViewController(NSViewController):
         root.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
         root.setAlignment_(NSLayoutAttributeLeading)
         root.setSpacing_(6.0)
-        root.setEdgeInsets_((10.0, 10.0, 10.0, 10.0))
+        # Top inset is intentionally larger than the other edges (~30pt).
+        # When the popover is dragged into a detached window, AppKit uses
+        # its default detachable-popover style — a translucent close button
+        # floats over the top-left corner of the content. The extra top
+        # padding gives that button empty space to sit over instead of
+        # overlapping the CPU sparkline panel. Popover mode just gets a
+        # slightly taller top margin, which reads as cleaner anyway.
+        root.setEdgeInsets_((30.0, 10.0, 10.0, 10.0))
         root.setDistribution_(NSStackViewDistributionFill)
         root.setTranslatesAutoresizingMaskIntoConstraints_(False)
 
