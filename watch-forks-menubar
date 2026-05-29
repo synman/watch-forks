@@ -179,7 +179,7 @@ _loader.exec_module(_wf)
 # seconds. The sentinel must compare-equal to 0.0 after JSON round-trip,
 # which int(0) and float(0.0) both do.
 MANUAL_INTERVAL = 0.0
-INTERVAL_CHOICES = [MANUAL_INTERVAL, 1.0, 2.0, 5.0, 10.0, 30.0]
+INTERVAL_CHOICES = [MANUAL_INTERVAL, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
 TOP_CHOICES = [5, 10, 15, 20, 25, 50]
 # (internal key, display label) — internal key is what's persisted.
 SORT_CHOICES = [("forks", "Forks"), ("cpu", "CPU%")]
