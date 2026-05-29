@@ -1860,14 +1860,31 @@ class _StatusClickTarget(NSObject):
 
 
 class _PopoverDelegate(NSObject):
-    """NSPopoverDelegate that allows the popover to be detached into a
-    floating window by dragging — Phase 5 optional feature.
+    """NSPopoverDelegate — detachment + post-show scroll reset.
 
-    macOS handles the detachment entirely once popoverShouldDetach_
-    returns True; no additional code required."""
+    Detachment: popoverShouldDetach_ returning True lets macOS turn the
+    popover into a floating window when dragged.
+
+    Post-show scroll: popoverDidShow_ fires AFTER AppKit's first real
+    layout pass, by which time the doc view's frame.height reflects the
+    actual row count. Calling scroll-to-top from here catches the
+    first-open case where the pre-show scroll ran before layout settled."""
+
+    def initWithApp_(self, app):  # noqa: N802
+        self = objc.super(_PopoverDelegate, self).init()
+        if self is None:
+            return None
+        self._app = app
+        return self
 
     def popoverShouldDetach_(self, popover):  # noqa: N802
         return True
+
+    def popoverDidShow_(self, notification):  # noqa: N802
+        try:
+            self._app._scroll_rows_to_top()
+        except Exception:
+            log.exception("post-show scroll-to-top failed")
 
 
 class WatchForksApp(rumps.App):
@@ -2042,7 +2059,7 @@ class WatchForksApp(rumps.App):
         # out into a detached floating window; the delegate's
         # popoverShouldDetach_ returning True enables that.
         popover.setBehavior_(NSPopoverBehaviorSemitransient)
-        self._popover_delegate = _PopoverDelegate.alloc().init()
+        self._popover_delegate = _PopoverDelegate.alloc().initWithApp_(self)
         popover.setDelegate_(self._popover_delegate)
         # Sizing — content view's intrinsic size carries through, but set
         # a reasonable default content size so the popover doesn't open
@@ -2096,13 +2113,20 @@ class WatchForksApp(rumps.App):
         """Snap the row scroll view back to the topmost row. macOS NSView's
         default coord origin is bottom-left (not flipped), so 'scroll to top'
         means scroll to y = documentView.height; constrainScrollPoint_ clamps
-        to the actual valid range so we don't overshoot."""
+        to the actual valid range so we don't overshoot.
+
+        Calls layoutSubtreeIfNeeded() first so the doc view's frame.height
+        reflects the current row count — on the FIRST popover open, child
+        view heights are still being computed and the doc frame is empty
+        until layout runs."""
         sv = getattr(self._vc, "_scroll_view", None) if self._vc is not None else None
         if sv is None:
             return
         doc = sv.documentView()
         if doc is None:
             return
+        # Force the doc view's auto-layout to settle so frame.height is real.
+        doc.layoutSubtreeIfNeeded()
         clip = sv.contentView()
         if doc.isFlipped():
             target = NSMakePoint(0.0, 0.0)
