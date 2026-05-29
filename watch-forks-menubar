@@ -748,6 +748,22 @@ class RichRowView(NSView):
         self._build_subviews()
         return self
 
+    def intrinsicContentSize(self):  # noqa: N802
+        # NSStackView uses Auto Layout and ignores our manual frame — without
+        # an intrinsicContentSize override, rows collapse to zero height and
+        # pile up at the bottom of the scroll view. The stack view's leading
+        # alignment + this size combine to give each row its fixed footprint.
+        total_w = (
+            _COL_SPACING
+            + _COL_SEV_W + _COL_SPACING
+            + _COL_ICON_W + _COL_SPACING
+            + _COL_NAME_W + _COL_SPACING
+            + _COL_SPARK_W + _COL_SPACING
+            + _COL_GAUGE_W + _COL_SPACING
+            + _COL_CPU_W + _COL_SPACING
+        )
+        return NSMakeSize(total_w, _ROW_H)
+
     def viewDidMoveToWindow(self):  # noqa: N802
         """Install the tracking area whenever we're added to a window."""
         objc.super(RichRowView, self).viewDidMoveToWindow()
