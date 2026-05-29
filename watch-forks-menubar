@@ -194,6 +194,11 @@ MAX_TOP = max(TOP_CHOICES)  # upper bound on row count for the popover
 # sparklines/gauges).
 POPOVER_WIDTH = 460.0
 POPOVER_ROW_AREA_HEIGHT = 640.0  # scroll view height cap — ~26 rows @ 24pt each
+# Fixed status item width — title content varies in pixel width per tick
+# ("4" wider than "1", arrow swaps direction, %CPU swings between 3 and 4
+# digits). Variable-length status item would resize the button per tick,
+# dragging the popover anchor with it. 175pt fits "❄️ 1234 / 999% ↑".
+STATUS_ITEM_LENGTH = 175.0
 
 
 def interval_label(sec: float) -> str:
@@ -1972,8 +1977,15 @@ class WatchForksApp(rumps.App):
             return
         btn.setTarget_(self._status_click_target)
         btn.setAction_(b"togglePopover:")
+        # Pin the status item to a fixed width. Default is NSVariableStatusItemLength
+        # (-1) which sizes to the title's current width — and since our title
+        # ("❄️ 973 / 178% ↑") shifts by 1-2 pixels as digits change ("4" wider than
+        # "1", arrow swaps direction, etc.), the status button reflows every tick.
+        # NSPopover anchors to that button and follows the shift → entire popover
+        # shudders left/right per refresh. Fixed length kills the anchor jitter.
+        item.setLength_(STATUS_ITEM_LENGTH)
         self._status_bound = True
-        log.info("status item bound to togglePopover")
+        log.info("status item bound to togglePopover (length=%.0fpt)", STATUS_ITEM_LENGTH)
 
     # ----- light/dark mode observer (Phase 5) -----
 
