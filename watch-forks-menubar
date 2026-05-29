@@ -65,6 +65,9 @@ from AppKit import (
     NSBoxSeparator,
     NSButton,
     NSColor,
+    NSEvent,
+    NSEventMaskLeftMouseDown,
+    NSEventMaskRightMouseDown,
     NSFloatingWindowLevel,
     NSFont,
     NSFontAttributeName,
@@ -1894,6 +1897,24 @@ class _PopoverDelegate(NSObject):
         except Exception:
             log.exception("post-show scroll-to-top failed")
 
+    def popoverDidClose_(self, notification):  # noqa: N802
+        # Tear down the global click monitor when the popover closes —
+        # otherwise the next click anywhere would still try to close a
+        # popover that's already gone.
+        try:
+            self._app._remove_outside_click_monitor()
+        except Exception:
+            log.exception("post-close monitor cleanup failed")
+
+    def popoverDidDetach_(self, popover):  # noqa: N802
+        # Drop the outside-click monitor when the popover becomes a
+        # standalone window — the detached window manages its own
+        # lifecycle (red close button, ⌘W, etc.).
+        try:
+            self._app._remove_outside_click_monitor()
+        except Exception:
+            log.exception("post-detach monitor cleanup failed")
+
     def detachableWindowForPopover_(self, popover):  # noqa: N802
         """Provide a properly-titled NSWindow when the popover detaches.
 
@@ -1977,6 +1998,11 @@ class WatchForksApp(rumps.App):
         self._vc: Optional[WatchForksViewController] = None
         self._menu_action_target: Optional[_MenuActionTarget] = None
         self._status_click_target: Optional[_StatusClickTarget] = None
+        # Global event monitor for clicks outside the popover. Installed
+        # when the popover shows; removed when it closes or detaches.
+        # Lets us close on outside-click without using NSPopoverBehaviorTransient
+        # (which breaks drag-to-detach).
+        self._outside_click_monitor = None
 
         # Hide rumps's default NSMenu — the status item action is rebound
         # to togglePopover_ in _bind_status_item_to_popover.
@@ -2094,12 +2120,13 @@ class WatchForksApp(rumps.App):
 
         popover = NSPopover.alloc().init()
         popover.setContentViewController_(vc)
-        # Transient: closes on any click outside the popover (other apps,
-        # the desktop, another menu bar item) — the natural behavior
-        # operators expect from a status-bar dropdown. Detachability still
-        # works via popoverShouldDetach_ returning True; the behavior
-        # constant only governs auto-close, not detach support.
-        popover.setBehavior_(NSPopoverBehaviorTransient)
+        # Semitransient is required for clean drag-to-detach. Transient
+        # was nicer for outside-click-close, but Apple only guarantees
+        # detach with Semitransient — and empirically, Transient caused
+        # the popover to dismiss the moment the detach gesture started.
+        # We get outside-click-close back via a global NSEvent monitor
+        # installed when the popover shows (see _install_outside_click_monitor).
+        popover.setBehavior_(NSPopoverBehaviorSemitransient)
         self._popover_delegate = _PopoverDelegate.alloc().initWithApp_(self)
         popover.setDelegate_(self._popover_delegate)
         # Sizing — content view's intrinsic size carries through, but set
@@ -2115,6 +2142,35 @@ class WatchForksApp(rumps.App):
         self._popover = popover
         log.info("popover constructed (width=%.0f)", POPOVER_WIDTH)
         return popover
+
+    def _install_outside_click_monitor(self) -> None:
+        """Watch for left/right mouse-down events outside our process. On
+        any click, close the popover if it's still anchored (not detached).
+        The monitor fires once per click; we self-uninstall after handling
+        so each open gets a fresh monitor."""
+        if self._outside_click_monitor is not None:
+            return
+        mask = NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown
+        def handler(event):
+            try:
+                if (
+                    self._popover is not None
+                    and self._popover.isShown()
+                    and not self._popover.isDetached()
+                ):
+                    self._popover.performClose_(None)
+            except Exception:
+                log.exception("outside-click handler failed")
+            finally:
+                self._remove_outside_click_monitor()
+        self._outside_click_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            mask, handler,
+        )
+
+    def _remove_outside_click_monitor(self) -> None:
+        if self._outside_click_monitor is not None:
+            NSEvent.removeMonitor_(self._outside_click_monitor)
+            self._outside_click_monitor = None
 
     def _close_popover_if_shown(self) -> None:
         """Dismiss the popover immediately (no animation). Used before any
@@ -2149,6 +2205,10 @@ class WatchForksApp(rumps.App):
         popover.showRelativeToRect_ofView_preferredEdge_(
             sender.bounds(), sender, NSRectEdgeMinY,
         )
+        # Now that the popover is up, arm the outside-click monitor so any
+        # click in another app dismisses it (the Semitransient behavior
+        # alone wouldn't catch clicks outside our window).
+        self._install_outside_click_monitor()
 
     def _scroll_rows_to_top(self) -> None:
         """Snap the row scroll view back to the topmost row. macOS NSView's
