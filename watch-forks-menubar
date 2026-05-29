@@ -86,6 +86,7 @@ from AppKit import (
     NSPopoverBehaviorTransient,
     NSRectEdgeMinY,
     NSScrollView,
+    NSScrollerStyleOverlay,
     NSStackView,
     NSStackViewDistributionFill,
     NSStackViewDistributionFillEqually,
@@ -1416,6 +1417,7 @@ class WatchForksViewController(NSViewController):
         self._header_view = None
         self._row_stack = None
         self._scroll_view = None
+        self._scroll_height_constraint = None
         self._settings_menu = None
 
     # ----- view construction (called once by AppKit) -----
@@ -1464,15 +1466,22 @@ class WatchForksViewController(NSViewController):
         scroll = NSScrollView.alloc().init()
         scroll.setHasVerticalScroller_(True)
         scroll.setHasHorizontalScroller_(False)
+        # Force overlay scroller style — legacy scrollers reserve width and
+        # appear/disappear as content height fluctuates, producing a 1-2px
+        # horizontal "shutter" on every refresh. Overlay scrollers overlay
+        # the content with no layout impact.
+        scroll.setScrollerStyle_(NSScrollerStyleOverlay)
         scroll.setBorderType_(0)  # NSNoBorder
         scroll.setDrawsBackground_(False)
         scroll.setDocumentView_(row_stack)
         scroll.setTranslatesAutoresizingMaskIntoConstraints_(False)
-        # Width: match root width minus root insets; height: capped.
-        from AppKit import NSLayoutConstraint
-        scroll.heightAnchor().constraintEqualToConstant_(
+        # Width fixed; height starts at the cap but is resized dynamically
+        # by _apply_layout_for_row_count when the row count changes, so the
+        # popover snaps to fit content when there are fewer than max rows.
+        self._scroll_height_constraint = scroll.heightAnchor().constraintEqualToConstant_(
             POPOVER_ROW_AREA_HEIGHT
-        ).setActive_(True)
+        )
+        self._scroll_height_constraint.setActive_(True)
         scroll.widthAnchor().constraintEqualToConstant_(
             POPOVER_WIDTH - 20.0
         ).setActive_(True)
@@ -1702,6 +1711,29 @@ class WatchForksViewController(NSViewController):
             for view in self._row_views[n:]:
                 self._row_stack.removeView_(view)
             del self._row_views[n:]
+        if n != current:
+            # Only recompute when row count actually changed — avoids
+            # per-tick layout churn on a stable top-N.
+            self._apply_layout_for_row_count(n)
+
+    def _apply_layout_for_row_count(self, n: int) -> None:
+        """Resize the scroll view + popover content size to fit exactly `n`
+        rows, capped at POPOVER_ROW_AREA_HEIGHT. When n*row_height < cap,
+        the popover snaps to fit content instead of leaving empty space."""
+        row_spacing = 2.0  # matches row_stack.setSpacing_(2.0)
+        if n <= 0:
+            rows_h = 0.0
+        else:
+            rows_h = n * _ROW_H + (n - 1) * row_spacing
+        scroll_h = min(rows_h, POPOVER_ROW_AREA_HEIGHT)
+        if self._scroll_height_constraint is not None:
+            self._scroll_height_constraint.setConstant_(scroll_h)
+        # Header (HEADER_HEIGHT) + sep (~2) + scroll_h + sep (~2) + footer
+        # (~32) + 4×6pt root spacing + 2×10pt insets ≈ HEADER + 80 + scroll_h.
+        chrome_h = HeaderOverviewView.HEADER_HEIGHT + 80.0
+        new_size = NSMakeSize(POPOVER_WIDTH, chrome_h + scroll_h)
+        if self._app is not None and self._app._popover is not None:
+            self._app._popover.setContentSize_(new_size)
 
 
 # ===========================================================================
@@ -2014,12 +2046,15 @@ class WatchForksApp(rumps.App):
         return popover
 
     def _close_popover_if_shown(self) -> None:
-        """Dismiss the popover. Used before any modal alert or focus-stealing
-        action — the popover lives at NSPopUpMenuWindowLevel and traps modal
-        dialogs underneath it, locking the UI. Closing first avoids the
-        ordering problem entirely."""
+        """Dismiss the popover immediately (no animation). Used before any
+        modal alert or focus-stealing action — the popover lives at
+        NSPopUpMenuWindowLevel and traps modal dialogs underneath it,
+        locking the UI. close() returns synchronously; performClose_ runs
+        an async close animation that doesn't complete before subprocess
+        calls block the main thread, so the popover is still visible when
+        the downstream dialog appears."""
         if self._popover is not None and self._popover.isShown():
-            self._popover.performClose_(None)
+            self._popover.close()
 
     def _toggle_popover(self, sender) -> None:
         """Click handler — toggle popover visibility, anchored under the
