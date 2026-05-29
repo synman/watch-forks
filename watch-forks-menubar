@@ -2055,10 +2055,12 @@ class WatchForksApp(rumps.App):
 
         popover = NSPopover.alloc().init()
         popover.setContentViewController_(vc)
-        # Phase 5: semitransient behavior allows the user to drag the popover
-        # out into a detached floating window; the delegate's
-        # popoverShouldDetach_ returning True enables that.
-        popover.setBehavior_(NSPopoverBehaviorSemitransient)
+        # Transient: closes on any click outside the popover (other apps,
+        # the desktop, another menu bar item) — the natural behavior
+        # operators expect from a status-bar dropdown. Detachability still
+        # works via popoverShouldDetach_ returning True; the behavior
+        # constant only governs auto-close, not detach support.
+        popover.setBehavior_(NSPopoverBehaviorTransient)
         self._popover_delegate = _PopoverDelegate.alloc().initWithApp_(self)
         popover.setDelegate_(self._popover_delegate)
         # Sizing — content view's intrinsic size carries through, but set
