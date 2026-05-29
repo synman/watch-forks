@@ -1870,44 +1870,6 @@ class _StatusClickTarget(NSObject):
             log.exception("togglePopover failed")
 
 
-class _DetachedWindowDelegate(NSObject):
-    """NSWindowDelegate that logs every lifecycle event of the detached
-    window — diagnostic harness for the disappearing-on-release bug."""
-
-    def initWithApp_(self, app):  # noqa: N802
-        self = objc.super(_DetachedWindowDelegate, self).init()
-        if self is None:
-            return None
-        self._app = app
-        return self
-
-    @objc.python_method
-    def _log(self, event, notification):
-        win = notification.object() if notification is not None else None
-        try:
-            frame = win.frame() if win is not None else None
-            visible = win.isVisible() if win is not None else None
-            on_screen = win.isOnActiveSpace() if win is not None else None
-            mini = win.isMiniaturized() if win is not None else None
-            log.info(
-                "DETACH-WIN %s  frame=%s  isVisible=%s  isOnActiveSpace=%s  isMiniaturized=%s",
-                event, frame, visible, on_screen, mini,
-            )
-        except Exception:
-            log.exception("DETACH-WIN log helper failed for %s", event)
-
-    def windowWillClose_(self, n): self._log("willClose", n)        # noqa: N802
-    def windowDidResize_(self, n): self._log("didResize", n)        # noqa: N802
-    def windowDidMove_(self, n): self._log("didMove", n)            # noqa: N802
-    def windowDidMiniaturize_(self, n): self._log("didMiniaturize", n)  # noqa: N802
-    def windowDidDeminiaturize_(self, n): self._log("didDeminiaturize", n)  # noqa: N802
-    def windowDidBecomeKey_(self, n): self._log("didBecomeKey", n)  # noqa: N802
-    def windowDidResignKey_(self, n): self._log("didResignKey", n)  # noqa: N802
-    def windowDidBecomeMain_(self, n): self._log("didBecomeMain", n)  # noqa: N802
-    def windowDidResignMain_(self, n): self._log("didResignMain", n)  # noqa: N802
-    def windowDidExpose_(self, n): self._log("didExpose", n)        # noqa: N802
-
-
 class _PopoverDelegate(NSObject):
     """NSPopoverDelegate — detachment + post-show scroll reset.
 
@@ -1924,18 +1886,9 @@ class _PopoverDelegate(NSObject):
         if self is None:
             return None
         self._app = app
-        # Strong ref to the detached NSWindow — without this, PyObjC GCs the
-        # window after detachableWindowForPopover_ returns and the popover
-        # appears to "disappear" on drag-release.
-        self._detached_window = None
-        self._detached_window_delegate = None
         return self
 
     def popoverShouldDetach_(self, popover):  # noqa: N802
-        log.info(
-            "DETACH popoverShouldDetach_ called; popover.isShown=%s isDetached=%s",
-            popover.isShown(), popover.isDetached(),
-        )
         return True
 
     def popoverDidShow_(self, notification):  # noqa: N802
@@ -1945,165 +1898,16 @@ class _PopoverDelegate(NSObject):
             log.exception("post-show scroll-to-top failed")
 
     def popoverDidClose_(self, notification):  # noqa: N802
-        popover = notification.object()
-        reason = "<unknown>"
-        try:
-            user_info = notification.userInfo()
-            if user_info is not None:
-                reason = str(user_info.get("NSPopoverCloseReasonKey", "<no-key>"))
-        except Exception:
-            log.exception("popoverDidClose_ userInfo unpack failed")
-        log.info(
-            "DETACH popoverDidClose_  reason=%s  popover.isShown=%s  isDetached=%s",
-            reason,
-            popover.isShown() if popover is not None else "n/a",
-            popover.isDetached() if popover is not None else "n/a",
-        )
-        # popoverDidDetach_ apparently doesn't always fire — do the
-        # diagnostic + force-front here when the close reason is detach.
-        if "DetachToWindow" in reason:
-            w = self._detached_window
-            if w is not None:
-                try:
-                    cv = w.contentView()
-                    screen = w.screen()
-                    log.info(
-                        "DETACH-WIN-DIAG  contentView=%s  level=%d  isKeyWindow=%s  "
-                        "alphaValue=%.2f  isOpaque=%s  screen=%s",
-                        "set" if cv is not None else "None (!!!)",
-                        w.level(),
-                        w.isKeyWindow(),
-                        w.alphaValue(),
-                        w.isOpaque(),
-                        str(screen.frame()) if screen is not None else "None",
-                    )
-                    NSApp.activateIgnoringOtherApps_(True)
-                    w.makeKeyAndOrderFront_(None)
-                    w.orderFrontRegardless()
-                    log.info(
-                        "DETACH-WIN-DIAG  after force-front  isVisible=%s  "
-                        "isKeyWindow=%s  frame=%s",
-                        w.isVisible(), w.isKeyWindow(), w.frame(),
-                    )
-                except Exception:
-                    log.exception("DETACH-WIN-DIAG failed")
-        # Tear down the global click monitor.
         try:
             self._app._remove_outside_click_monitor()
         except Exception:
             log.exception("post-close monitor cleanup failed")
 
     def popoverDidDetach_(self, popover):  # noqa: N802
-        w = self._detached_window
-        log.info(
-            "DETACH popoverDidDetach_  popover.isShown=%s  isDetached=%s",
-            popover.isShown(), popover.isDetached(),
-        )
-        if w is not None:
-            try:
-                cv = w.contentView()
-                screen = w.screen()
-                log.info(
-                    "DETACH-WIN  contentView=%s  level=%d  isKeyWindow=%s  isMainWindow=%s  "
-                    "alphaValue=%.2f  screen=%s",
-                    "set" if cv is not None else "None",
-                    w.level(),
-                    w.isKeyWindow(), w.isMainWindow(),
-                    w.alphaValue(),
-                    str(screen.frame()) if screen is not None else "None (off-screen!)",
-                )
-                # Force the window forward in case AppKit didn't order it
-                # itself, and activate the app so the window can be focused.
-                NSApp.activateIgnoringOtherApps_(True)
-                w.makeKeyAndOrderFront_(None)
-                w.orderFrontRegardless()
-                log.info(
-                    "DETACH-WIN  after makeKey+orderFront  isVisible=%s  isKeyWindow=%s  "
-                    "frame=%s",
-                    w.isVisible(), w.isKeyWindow(), w.frame(),
-                )
-            except Exception:
-                log.exception("DETACH-WIN post-detach force-front failed")
         try:
             self._app._remove_outside_click_monitor()
         except Exception:
             log.exception("post-detach monitor cleanup failed")
-
-    def detachableWindowForPopover_(self, popover):  # noqa: N802
-        """Provide a properly-titled NSWindow when the popover detaches.
-
-        Without this, AppKit creates its default "detachable popover window"
-        which uses NSWindowStyleMaskFullSizeContentView — the close button
-        floats translucently over the top-left of the popover content. By
-        returning a real titled window, the close button sits in its own
-        title bar above the content, with no overlap.
-
-        AppKit calls -setContentView: on this window with the popover's
-        content view after we return it, so we don't need to install the
-        content view ourselves."""
-        log.info("DETACH detachableWindowForPopover_ called")
-        try:
-            content_size = popover.contentSize()
-            log.info(
-                "DETACH  content_size = %.1fx%.1f",
-                content_size.width, content_size.height,
-            )
-            rect = NSMakeRect(0.0, 0.0, content_size.width, content_size.height)
-            style = (
-                NSWindowStyleMaskTitled
-                | NSWindowStyleMaskClosable
-                | NSWindowStyleMaskMiniaturizable
-                | NSWindowStyleMaskResizable
-            )
-            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                rect, style, NSBackingStoreBuffered, False,
-            )
-            win.setTitle_("watch-forks")
-            win.setReleasedWhenClosed_(False)
-            # Explicitly install the popover's content view controller as
-            # the window's content view controller. NSWindow auto-creates
-            # a default empty contentView in initWithContentRect_, which
-            # makes AppKit's "if window.contentView is nil, install
-            # popover.contentView" path NOT fire — the rich popover view
-            # stays orphaned and we get a blank titled window.
-            vc = popover.contentViewController()
-            if vc is not None:
-                win.setContentViewController_(vc)
-            # Attach window delegate to log lifecycle events.
-            wdel = _DetachedWindowDelegate.alloc().initWithApp_(self._app)
-            self._detached_window_delegate = wdel  # retain
-            win.setDelegate_(wdel)
-            # Position the window near where the popover anchor is (the
-            # status item). Without this the window initWithContentRect
-            # frame defaults to (0,0) which is the bottom-left corner of
-            # the main display in macOS coords — partially hidden behind
-            # the Dock, looks like the window "disappeared".
-            try:
-                pv = popover.positioningView()
-                vwin = pv.window() if pv is not None else None
-                if pv is not None and vwin is not None:
-                    pv_rect_in_window = pv.convertRect_toView_(pv.bounds(), None)
-                    pv_rect_in_screen = vwin.convertRectToScreen_(pv_rect_in_window)
-                    # Drop the window's top-left ~10pt below the status item.
-                    top_left = NSMakePoint(
-                        pv_rect_in_screen.origin.x,
-                        pv_rect_in_screen.origin.y - 10.0,
-                    )
-                    win.setFrameTopLeftPoint_(top_left)
-                else:
-                    win.center()
-            except Exception:
-                log.exception("DETACH window-position calc failed; centering")
-                win.center()
-            self._detached_window = win
-            log.info(
-                "DETACH  window created  frame=%s  isVisible=%s",
-                win.frame(), win.isVisible(),
-            )
-            return win
-        except Exception:
-            log.exception("detachableWindowForPopover_ failed; falling back to default")
-            return None
 
 
 class WatchForksApp(rumps.App):
