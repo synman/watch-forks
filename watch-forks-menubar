@@ -1886,6 +1886,10 @@ class _PopoverDelegate(NSObject):
         if self is None:
             return None
         self._app = app
+        # Strong ref to the detached NSWindow — without this, PyObjC GCs the
+        # window after detachableWindowForPopover_ returns and the popover
+        # appears to "disappear" on drag-release.
+        self._detached_window = None
         return self
 
     def popoverShouldDetach_(self, popover):  # noqa: N802
@@ -1941,6 +1945,9 @@ class _PopoverDelegate(NSObject):
             )
             win.setTitle_("watch-forks")
             win.setReleasedWhenClosed_(False)
+            # Keep a strong reference so PyObjC doesn't GC the window before
+            # AppKit completes the popover-to-window transition.
+            self._detached_window = win
             return win
         except Exception:
             log.exception("detachableWindowForPopover_ failed; falling back to default")
