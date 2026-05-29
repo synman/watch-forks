@@ -358,8 +358,8 @@ SEV_BY_STATE = {"cold": SEV_NORMAL, "warm": SEV_WARN, "hot": SEV_HOT}
 # least CPU_TREND_EXIT in the opposite direction. Flat or sub-threshold
 # samples leave the current state alone, so the icon doesn't flap on
 # ps reporting jitter (±1-2% per sample is normal).
-CPU_TREND_ENTRY = 3.0  # %CPU delta to enter rising/falling from steady
-CPU_TREND_EXIT = 1.0   # %CPU opposite-direction delta to drop back to steady
+CPU_TREND_ENTRY = 10.0  # %CPU delta to enter rising/falling from steady
+CPU_TREND_EXIT = 5.0    # %CPU opposite-direction delta to drop back to steady
 TREND_RISING = "↑"
 TREND_FALLING = "↓"
 TREND_STEADY = "→"
