@@ -103,6 +103,11 @@ from AppKit import (
     NSUserInterfaceLayoutOrientationVertical,
     NSView,
     NSViewController,
+    NSWindow,
+    NSWindowStyleMaskClosable,
+    NSWindowStyleMaskMiniaturizable,
+    NSWindowStyleMaskResizable,
+    NSWindowStyleMaskTitled,
     NSWorkspace,
 )
 from Foundation import (
@@ -117,6 +122,9 @@ from Foundation import (
     NSRunLoopCommonModes,
     NSTimer,
 )
+# NSBackingStoreBuffered = 2 (from AppKit/NSWindow.h). Importing the constant
+# directly is unreliable across PyObjC versions, but the int is stable.
+NSBackingStoreBuffered = 2
 
 # NSAlert.runModal() return constants
 NS_ALERT_FIRST = 1000
@@ -1885,6 +1893,37 @@ class _PopoverDelegate(NSObject):
             self._app._scroll_rows_to_top()
         except Exception:
             log.exception("post-show scroll-to-top failed")
+
+    def detachableWindowForPopover_(self, popover):  # noqa: N802
+        """Provide a properly-titled NSWindow when the popover detaches.
+
+        Without this, AppKit creates its default "detachable popover window"
+        which uses NSWindowStyleMaskFullSizeContentView — the close button
+        floats translucently over the top-left of the popover content. By
+        returning a real titled window, the close button sits in its own
+        title bar above the content, with no overlap.
+
+        AppKit calls -setContentView: on this window with the popover's
+        content view after we return it, so we don't need to install the
+        content view ourselves."""
+        try:
+            content_size = popover.contentSize()
+            rect = NSMakeRect(0.0, 0.0, content_size.width, content_size.height)
+            style = (
+                NSWindowStyleMaskTitled
+                | NSWindowStyleMaskClosable
+                | NSWindowStyleMaskMiniaturizable
+                | NSWindowStyleMaskResizable
+            )
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                rect, style, NSBackingStoreBuffered, False,
+            )
+            win.setTitle_("watch-forks")
+            win.setReleasedWhenClosed_(False)
+            return win
+        except Exception:
+            log.exception("detachableWindowForPopover_ failed; falling back to default")
+            return None
 
 
 class WatchForksApp(rumps.App):
