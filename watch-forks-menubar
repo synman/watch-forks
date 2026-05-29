@@ -192,7 +192,7 @@ MAX_TOP = max(TOP_CHOICES)  # upper bound on row count for the popover
 # a one-line NSTextField, so the height will need to grow once rows have
 # sparklines/gauges).
 POPOVER_WIDTH = 460.0
-POPOVER_ROW_AREA_HEIGHT = 400.0  # scroll view height cap
+POPOVER_ROW_AREA_HEIGHT = 640.0  # scroll view height cap — ~26 rows @ 24pt each
 
 
 def interval_label(sec: float) -> str:
@@ -330,7 +330,8 @@ SEV_HOT = "🔥"     # 🔥 — fork-bomb territory
 # A flatline (rate ≈ 0) holds the current state; only a real rise/fall
 # event crosses a threshold. hot never drops directly to cold — it has to
 # cool through warm, which prevents flapping on a single quiet sample.
-RATE_WINDOW_SECONDS = 30.0
+RATE_WINDOW_SECONDS = 300.0  # 5 minutes — gives sparklines meaningful history
+                              # and smooths rate calculations against ps jitter
 RATE_WARM_ENTRY = 1.0   # ≥ +1 proc/s sustained → warming
 RATE_HOT_ENTRY = 5.0    # ≥ +5 proc/s sustained → hot
 RATE_COOL_ENTRY = 0.0   # ≤ 0 proc/s (flatline or compaction) → cools warm→cold
@@ -578,7 +579,7 @@ class SparklineView(NSView):
     2 samples are available the view renders blank. Color tracks severity.
     """
 
-    _MAX_SAMPLES = 16
+    _MAX_SAMPLES = 48  # bumped from 16 — denser sparkline given the 5min window
 
     def initWithFrame_(self, frame):  # noqa: N802
         self = objc.super(SparklineView, self).initWithFrame_(frame)
@@ -1144,6 +1145,11 @@ class SparklinePanelView(NSView):
         value_row.setTranslatesAutoresizingMaskIntoConstraints_(False)
         value_row.addView_inGravity_(self._value_label, NSStackViewGravityLeading)
         value_row.addView_inGravity_(self._glyph_view, NSStackViewGravityLeading)
+        # Pin the value label width so per-tick text changes (e.g. "1234%"
+        # vs "98%" vs "+12.3/s") don't shuffle the intrinsic content size
+        # and trigger a stack-view relayout on the entire header — the
+        # visible "shutter" on every refresh.
+        self._value_label.widthAnchor().constraintEqualToConstant_(100.0).setActive_(True)
 
         # Outer vertical stack: caption → value_row (sparkline drawn in drawRect_)
         outer = NSStackView.alloc().init()
@@ -1996,10 +2002,24 @@ class WatchForksApp(rumps.App):
         # Sizing — content view's intrinsic size carries through, but set
         # a reasonable default content size so the popover doesn't open
         # at 0×0 in case auto-layout hasn't computed yet.
-        popover.setContentSize_(NSMakeSize(POPOVER_WIDTH, 600.0))
+        # Computed default size: header + sep + row area + sep + footer + spacing/insets.
+        # Layout: 92 (header) + 2 (sep) + 640 (rows) + 2 (sep) + 32 (footer)
+        # + 4×6 (spacing) + 2×10 (insets) ≈ 814pt.
+        popover.setContentSize_(NSMakeSize(
+            POPOVER_WIDTH,
+            HeaderOverviewView.HEADER_HEIGHT + POPOVER_ROW_AREA_HEIGHT + 80.0
+        ))
         self._popover = popover
         log.info("popover constructed (width=%.0f)", POPOVER_WIDTH)
         return popover
+
+    def _close_popover_if_shown(self) -> None:
+        """Dismiss the popover. Used before any modal alert or focus-stealing
+        action — the popover lives at NSPopUpMenuWindowLevel and traps modal
+        dialogs underneath it, locking the UI. Closing first avoids the
+        ordering problem entirely."""
+        if self._popover is not None and self._popover.isShown():
+            self._popover.performClose_(None)
 
     def _toggle_popover(self, sender) -> None:
         """Click handler — toggle popover visibility, anchored under the
@@ -2406,6 +2426,9 @@ class WatchForksApp(rumps.App):
         self._tick()
 
     def _toggle_login(self, _sender) -> None:
+        # Modal alert follows — close the popover first so the alert isn't
+        # trapped underneath it.
+        self._close_popover_if_shown()
         if is_login_enabled():
             ok = disable_login()
             if ok:
@@ -2444,6 +2467,9 @@ class WatchForksApp(rumps.App):
 
         def _cb(_sender):
             log.info("kill action invoked: pid=%d name=%s sig=%s", pid, name, sig_name)
+            # Confirmation modal follows — close popover so it isn't trapped
+            # behind it.
+            self._close_popover_if_shown()
             resp = floating_alert(
                 title=f"Send {sig_name}?",
                 message=f"PID {pid}  ({name})\n\nThis cannot be undone.",
@@ -2497,6 +2523,9 @@ class WatchForksApp(rumps.App):
         # instead of a half-second flash of "shell$ /path/to/watch-forks ...".
         # In Manual mode (interval==0) we'd pass -i 0 → tight loop in
         # watch-forks; fall back to DEFAULT_INTERVAL for the terminal run.
+        # Close popover before launching Terminal so focus transfer doesn't
+        # leave a stale popover hanging.
+        self._close_popover_if_shown()
         term_interval = self.interval if self.interval > 0 else DEFAULT_INTERVAL
         script = (
             'tell application "Terminal"\n'
