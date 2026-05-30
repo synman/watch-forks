@@ -2,5 +2,9 @@
 # watch-forks (the CLI) is stdlib-only and has no dependencies.
 
 rumps>=0.4.0
-pyobjc-core>=10.0
-pyobjc-framework-Cocoa>=10.0
+# pyobjc-core 12.2 has a regression that prevents the menu-bar NSStatusItem from
+# rendering on macOS 26 (Tahoe) — the app runs and "binds" the item but no icon
+# draws. 12.1 is the proven-good release (same macOS, rumps, and Python). Cap below
+# 12.2 until a fixed pyobjc-core ships; bump the ceiling once verified. (2026-05-30)
+pyobjc-core>=10.0,<12.2
+pyobjc-framework-Cocoa>=10.0,<12.2
