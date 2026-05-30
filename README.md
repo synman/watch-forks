@@ -87,15 +87,9 @@ ln -s "$PWD/watch-forks-menubar"  ~/bin/watch-forks-menubar
 
 ### A note on the Python environment
 
-`watch-forks-menubar` needs the [`rumps`](https://github.com/jaredks/rumps) + PyObjC stack. Default shebang is `#!/usr/bin/env python3`, so it picks up whichever `python3` is on your `PATH` at launch.
+`watch-forks-menubar` needs the [`rumps`](https://github.com/jaredks/rumps) + PyObjC stack. The default shebang is `#!/usr/bin/env python3`, so a **foreground** launch (`~/bin/watch-forks-menubar &`) picks up whichever `python3` is on your `PATH`. If you keep `rumps` in a virtualenv (recommended), launch it from a shell where that venv is active / on `PATH` (or replace the shebang with the venv's absolute path, e.g. `#!/Users/you/.virtualenvs/yourenv/bin/python3`).
 
-If you keep `rumps` in a virtualenv (recommended), either activate the venv before launching, or replace the shebang with the venv's absolute path:
-
-```python
-#!/Users/you/.virtualenvs/yourenv/bin/python3
-```
-
-Doing the latter also makes "Start at login" work without venv activation — the LaunchAgent invokes the script directly, with no shell to activate anything.
+**Start at login just works regardless of your `PATH`.** When you toggle "Start at login", the widget pins the exact interpreter currently running it (`sys.executable`) into the LaunchAgent's `ProgramArguments` — so launchd invokes that same rumps-capable interpreter directly, no shell or shebang editing needed. Toggle it from a running instance that already has the deps and it carries over to every login.
 
 `watch-forks` (the CLI) is stdlib-only and runs under any Python 3.10+.
 
@@ -128,7 +122,13 @@ open build/watch-forks-menubar.app
 open /Applications/watch-forks-menubar.app
 ```
 
-The bundle still assumes `python3` on `$PATH` has `rumps` + `pyobjc` installed. If you use a virtualenv, either activate it before launching, or modify the wrapper's shebang at `Contents/MacOS/watch-forks-menubar` to point to your venv's interpreter.
+`build-app-bundle.sh` auto-detects a `python3` that can `import rumps` and bakes its **absolute path** into the bundle's `Contents/MacOS/watch-forks-menubar` wrapper at build time — so the bundle launches correctly under LaunchServices regardless of `PATH`. Build it from a shell where your rumps-capable interpreter is on `PATH`, or point at one explicitly:
+
+```bash
+WATCH_FORKS_PYTHON=/Users/you/.virtualenvs/yourenv/bin/python3 ./build-app-bundle.sh --install
+```
+
+The build fails fast with an explanatory message if no rumps-capable interpreter is found.
 
 ## Usage
 

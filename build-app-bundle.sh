@@ -38,13 +38,32 @@ cp "$REPO_ROOT/watch-forks" "$RESOURCES_DIR/watch-forks"
 echo "  • Copying watch-forks-menubar.py to Resources/"
 cp "$REPO_ROOT/watch-forks-menubar" "$RESOURCES_DIR/watch-forks-menubar.py"
 
-# Create the MacOS wrapper executable
+# Resolve a python3 that actually has rumps installed and bake its ABSOLUTE path
+# into the wrapper. LaunchServices/launchd start the bundle with a minimal PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin), so a bare `python3` resolves to the system
+# interpreter — which lacks rumps/pyobjc when deps live in a venv. Override the
+# auto-detected interpreter with WATCH_FORKS_PYTHON=/path/to/venv/bin/python3.
+echo "  • Resolving a rumps-capable python3"
+PYTHON_BIN="${WATCH_FORKS_PYTHON:-$(command -v python3 || true)}"
+if [[ -z "$PYTHON_BIN" ]] || ! "$PYTHON_BIN" -c 'import rumps' 2>/dev/null; then
+    echo "❌ No python3 with 'rumps' found."
+    echo "   Install deps first:   python3 -m pip install -r requirements.txt"
+    echo "   Or point at a venv:   WATCH_FORKS_PYTHON=/path/to/venv/bin/python3 $0 ${1:-}"
+    exit 1
+fi
+# Canonicalize to the real interpreter path (resolves venv shim symlinks).
+PYTHON_BIN="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
+echo "    → $PYTHON_BIN"
+
+# Create the MacOS wrapper executable (interpreter path baked at build time;
+# runtime vars escaped so they expand when the wrapper runs, not now).
 echo "  • Creating MacOS wrapper executable"
-cat > "$MACOS_DIR/watch-forks-menubar" << 'EOF'
+cat > "$MACOS_DIR/watch-forks-menubar" << EOF
 #!/usr/bin/env bash
-# Wrapper to launch watch-forks-menubar from the app bundle
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-exec /usr/bin/env python3 "${SCRIPT_DIR}/../Resources/watch-forks-menubar.py" "$@"
+# Wrapper to launch watch-forks-menubar from the app bundle.
+# Interpreter path is baked at build time — launchd has no venv on PATH.
+SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd -P)"
+exec "$PYTHON_BIN" "\${SCRIPT_DIR}/../Resources/watch-forks-menubar.py" "\$@"
 EOF
 chmod +x "$MACOS_DIR/watch-forks-menubar"
 
