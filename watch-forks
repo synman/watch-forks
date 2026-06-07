@@ -19,6 +19,8 @@ NAME column extraction order:
                                                 (handles "Microsoft Teams" etc.;
                                                  Darwin kernel caps at 16 chars)
   4.  Post-process: claude CLI w/ `--name claude-<scope>` → that scope
+  5.  Post-process: copilot/crush/opencode CLI → resolve CWD via lsof
+                    → map to .workspace-paths key → `<binary>-<scope>`
 
 macOS-only — uses BSD-style `ps -eM` for per-thread output (no Linux equivalent).
 """
@@ -70,7 +72,79 @@ NPM_EXEC = re.compile(r"^(?:npm\s+exec|npx)\s+(?:@[^/\s]+/)?(\S+)")
 JS_EXTS = (".js", ".mjs", ".cjs")
 VERSION_UCOMM = re.compile(r"^[0-9]+\.[0-9]+")
 CLAUDE_NAME_ARG = re.compile(r"--name\s+(\S+)")
+COPILOT_BIN = re.compile(r"(?:^|/)copilot$")
 GENERIC_BASENAMES = {"server", "main", "__main__", "index", "cli"}
+
+# CWD-to-scope resolution for processes that don't carry --name (e.g. copilot).
+# Reads .workspace-paths once per render cycle; maps absolute CWD → key.
+_WP_CACHE: dict[str, str] | None = None
+_WP_MTIME: float = 0.0
+
+def _load_workspace_paths() -> dict[str, str]:
+    """Return {absolute_path: key} from .workspace-paths, longest-path-first."""
+    global _WP_CACHE, _WP_MTIME
+    wp = os.path.expanduser("~/.workspace-paths")
+    if not os.path.isfile(wp):
+        isaac = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             os.pardir, "claude-isaac", ".workspace-paths")
+        if os.path.isfile(isaac):
+            wp = isaac
+        else:
+            return _WP_CACHE or {}
+    try:
+        mt = os.path.getmtime(wp)
+    except OSError:
+        return _WP_CACHE or {}
+    if _WP_CACHE is not None and mt == _WP_MTIME:
+        return _WP_CACHE
+    mapping: dict[str, str] = {}
+    try:
+        for line in open(wp, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.strip()
+            if key.endswith(("_tier", "_github", "_authors", "_alias",
+                             "_no_readme")):
+                continue
+            if val and os.path.isabs(val):
+                mapping[val] = key
+    except OSError:
+        pass
+    _WP_CACHE = mapping
+    _WP_MTIME = mt
+    return mapping
+
+
+def _cwd_to_scope(cwd: str) -> str:
+    """Map an absolute CWD to a workspace-paths key (longest-prefix match)."""
+    wp = _load_workspace_paths()
+    best_key = ""
+    best_len = 0
+    for path, key in wp.items():
+        if cwd == path or cwd.startswith(path + "/"):
+            if len(path) > best_len:
+                best_key = key
+                best_len = len(path)
+    if best_key:
+        return best_key
+    return os.path.basename(cwd) or cwd
+
+
+def _resolve_cwd(pid: int) -> str:
+    """Resolve the CWD of a process via lsof (macOS). Returns '' on failure."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-p", str(pid), "-a", "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, check=False, timeout=2.0,
+        ).stdout
+        for line in out.splitlines():
+            if line.startswith("n/"):
+                return line[1:]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return ""
 
 
 def _run(cmd: list[str]) -> str:
@@ -151,12 +225,15 @@ def collect_procs() -> list[dict]:
     return rows
 
 
-def shortname(cmd: str, uc: str) -> str:
+def shortname(cmd: str, uc: str, pid: int = 0) -> str:
     """Derive a short display name. See module docstring for ordering."""
     # 0. Single-token COMMAND with no path separator = setproctitle rewrite
     #    (e.g. nginx-worker). Honor it before any path/python parsing.
+    #    Skip for binaries that need CWD-based scope resolution (step 5).
+    _CWD_RESOLVED = {"copilot", "crush", "opencode"}
     if cmd and " " not in cmd and "/" not in cmd:
-        return cmd
+        if cmd not in _CWD_RESOLVED:
+            return cmd
     # 1. Python interpreter at start of COMMAND
     m = PY_INTERP.match(cmd)
     if m:
@@ -217,6 +294,13 @@ def shortname(cmd: str, uc: str) -> str:
         m3 = CLAUDE_NAME_ARG.search(cmd)
         if m3:
             return m3.group(1)
+    # 5. Copilot / Crush / OpenCode have no --name; resolve CWD → scope
+    if name in ("copilot", "crush", "opencode", "opencode.exe") and pid:
+        cwd = _resolve_cwd(pid)
+        if cwd:
+            scope = _cwd_to_scope(cwd)
+            prefix = "opencode" if name == "opencode.exe" else name
+            return f"{prefix}-{scope}"
     return name
 
 
@@ -233,7 +317,7 @@ def render(top: int) -> None:
         forks[row["ppid"]] += 1
     rows = []
     for row in procs:
-        name = shortname(row["command"], ucomm.get(row["pid"], ""))
+        name = shortname(row["command"], ucomm.get(row["pid"], ""), row["pid"])
         if name == "tmux" and tmux_suffix:
             name = "tmux" + tmux_suffix
         rows.append((

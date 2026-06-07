@@ -2232,7 +2232,7 @@ class WatchForksApp(rumps.App):
         acc_cpu = compute_accumulated_pcpu(procs)
         out: list[tuple[int, int, int, str, str, str, float]] = []
         for row in procs:
-            name = _wf.shortname(row["command"], ucomm.get(row["pid"], ""))
+            name = _wf.shortname(row["command"], ucomm.get(row["pid"], ""), row["pid"])
             if name == "tmux" and tmux_suffix:
                 name = "tmux" + tmux_suffix
             pid = row["pid"]
