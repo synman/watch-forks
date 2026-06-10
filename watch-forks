@@ -132,8 +132,14 @@ def _cwd_to_scope(cwd: str) -> str:
     return os.path.basename(cwd) or cwd
 
 
+_cwd_cache: dict[int, str] = {}
+
 def _resolve_cwd(pid: int) -> str:
-    """Resolve the CWD of a process via lsof (macOS). Returns '' on failure."""
+    """Resolve the CWD of a process via lsof (macOS), cached per PID.
+    A process's CWD is stable for the lifetime of agent sessions, so one
+    lsof call per PID is sufficient — avoids subprocess-per-tick lag."""
+    if pid in _cwd_cache:
+        return _cwd_cache[pid]
     try:
         out = subprocess.run(
             ["lsof", "-p", str(pid), "-a", "-d", "cwd", "-Fn"],
@@ -141,9 +147,11 @@ def _resolve_cwd(pid: int) -> str:
         ).stdout
         for line in out.splitlines():
             if line.startswith("n/"):
-                return line[1:]
+                _cwd_cache[pid] = line[1:]
+                return _cwd_cache[pid]
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
+    _cwd_cache[pid] = ""
     return ""
 
 
@@ -230,7 +238,7 @@ def shortname(cmd: str, uc: str, pid: int = 0) -> str:
     # 0. Single-token COMMAND with no path separator = setproctitle rewrite
     #    (e.g. nginx-worker). Honor it before any path/python parsing.
     #    Skip for binaries that need CWD-based scope resolution (step 5).
-    _CWD_RESOLVED = {"copilot", "crush", "opencode"}
+    _CWD_RESOLVED = {"copilot", "crush", "opencode", "bun"}
     if cmd and " " not in cmd and "/" not in cmd:
         if cmd not in _CWD_RESOLVED:
             return cmd
@@ -294,12 +302,12 @@ def shortname(cmd: str, uc: str, pid: int = 0) -> str:
         m3 = CLAUDE_NAME_ARG.search(cmd)
         if m3:
             return m3.group(1)
-    # 5. Copilot / Crush / OpenCode have no --name; resolve CWD → scope
-    if name in ("copilot", "crush", "opencode", "opencode.exe") and pid:
+    # 5. Copilot / Crush / OpenCode / bun(OpenCode) have no --name; resolve CWD → scope
+    if name in ("copilot", "crush", "opencode", "opencode.exe", "bun") and pid:
         cwd = _resolve_cwd(pid)
         if cwd:
             scope = _cwd_to_scope(cwd)
-            prefix = "opencode" if name == "opencode.exe" else name
+            prefix = "oc" if name in ("opencode", "opencode.exe", "bun") else name
             return f"{prefix}-{scope}"
     return name
 
