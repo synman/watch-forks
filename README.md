@@ -43,7 +43,7 @@ A first-class status-bar app built on `NSPopover` + a custom `NSViewController`.
 - **Per-row rich view** — SF Symbol severity badge · process app icon · name · live per-PID sparkline · heat-graded colored gauge (blue → orange → red) · subtree-accumulated CPU%.
 - **Hover state** — rows tint with the system accent color on mouseover via `NSTrackingArea`.
 - **Light/dark mode reactive** — all colors are dynamic `NSColor.system*Color` semantics; `NSApplicationDidChangeEffectiveAppearanceNotification` triggers a redraw of all custom-drawn views.
-- **Animated gauge transitions** — `HeatGaugeView` interpolates fill changes through `NSAnimationContext` with a 0.25s ease-out.
+- **Live gauge updates** — `HeatGaugeView` repaints its heat-graded fill in the same tick the data changes (negligible deltas are skipped to avoid pointless repaints).
 - **Right-click context menu per row** — Copy PID, Show in Activity Monitor, Send SIGTERM (15), Send SIGKILL (9) with floating confirmation dialogs.
 - **Header row** shows live PID 1 (launchd) stats — `🔥 launchd · 824 forks · 8 threads · 1234.5% CPU`. PID 1 is always filtered from the process rows below so the bar scale isn't dominated by launchd's enormous fork count.
 - **Subtree-accumulated CPU%** on every row (each row's CPU = its own + all descendants), computed via iterative post-order traversal of the ppid tree.
@@ -55,8 +55,8 @@ A first-class status-bar app built on `NSPopover` + a custom `NSViewController`.
 #### Settings + lifecycle
 
 - **Configurable refresh interval** — `Manual` (no timer, refresh-on-demand) / `0.25s` / `0.5s` / `1s` / `2s` / `5s` / `10s` / `30s`.
-- **Top N** — `5` / `10` / `15` / `20` / `25` / `50` rows.
-- **Sort dimension** — by forks or by CPU%.
+- **Top N** — `5` / `10` / `15` / `20` / `25` / `50` / `Max` rows (`Max` = every process, no cap; the popover scrolls).
+- **Sort dimension** — by forks, CPU%, name, or tree (descendancy order: DFS of the ppid tree, siblings by PID, names indented by depth).
 - **Settings persisted atomically** to `~/Library/Application Support/watch-forks-menubar/settings.json` (tempfile + rename).
 - **Start-at-login toggle** writes a LaunchAgent plist to `~/Library/LaunchAgents/com.shellware.watch-forks-menubar.plist`.
 - **"Open full table in Terminal…"** launches `watch-forks` in a new Terminal window.
@@ -183,7 +183,7 @@ A few details worth flagging if you're reading the source:
 
 - **`NSTimer` in `NSRunLoopCommonModes`** for the popover refresh. `NSRunLoopDefaultMode` is suspended while menu tracking is active; common modes cover both default and `NSEventTrackingRunLoopMode`, so the tick keeps firing whether the popover is open or closed. Implementation drops out of rumps's `Timer` to a raw `NSTimer` with a small `NSObject` subclass as target.
 
-- **Custom NSView subclasses** drive the rich rendering: `RichRowView` (composite row), `SparklineView` (per-row fork-history sparkline), `HeatGaugeView` (animated colored gauge with `NSAnimationContext`), `HeaderOverviewView` (the three-panel header container), `SparklinePanelView` (one panel: caption + big value + glyph + sparkline). All use semantic `NSColor.system*Color` so dark mode just works.
+- **Custom NSView subclasses** drive the rich rendering: `RichRowView` (composite row), `SparklineView` (per-row fork-history sparkline), `HeatGaugeView` (heat-graded colored gauge), `HeaderOverviewView` (the three-panel header container), `SparklinePanelView` (one panel: caption + big value + glyph + sparkline). All use semantic `NSColor.system*Color` so dark mode just works.
 
 - **`intrinsicContentSize` on `RichRowView`** is required because `NSStackView` ignores `initWithFrame_` and uses Auto Layout — without an intrinsic size override, rows collapse to zero height and pile at the bottom of the scroll view.
 

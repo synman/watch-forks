@@ -38,6 +38,7 @@ import importlib.util
 import json
 import logging
 import logging.handlers
+import math
 import os
 import platform
 import signal
@@ -56,7 +57,6 @@ import objc
 import rumps
 from AppKit import (
     NSAlert,
-    NSAnimationContext,
     NSApp,
     NSAttributedString,
     NSBezierPath,
@@ -86,7 +86,6 @@ from AppKit import (
     NSMenuItem,
     NSPopover,
     NSPopoverBehaviorSemitransient,
-    NSPopoverBehaviorTransient,
     NSRectEdgeMinY,
     NSScrollView,
     NSScrollerStyleOverlay,
@@ -106,11 +105,6 @@ from AppKit import (
     NSUserInterfaceLayoutOrientationVertical,
     NSView,
     NSViewController,
-    NSWindow,
-    NSWindowStyleMaskClosable,
-    NSWindowStyleMaskMiniaturizable,
-    NSWindowStyleMaskResizable,
-    NSWindowStyleMaskTitled,
     NSWorkspace,
 )
 from Foundation import (
@@ -125,13 +119,9 @@ from Foundation import (
     NSRunLoopCommonModes,
     NSTimer,
 )
-# NSBackingStoreBuffered = 2 (from AppKit/NSWindow.h). Importing the constant
-# directly is unreliable across PyObjC versions, but the int is stable.
-NSBackingStoreBuffered = 2
 
-# NSAlert.runModal() return constants
+# NSAlert.runModal() — first-button return constant (second button = 1001)
 NS_ALERT_FIRST = 1000
-NS_ALERT_SECOND = 1001
 
 
 def floating_alert(
@@ -192,13 +182,20 @@ _loader.exec_module(_wf)
 # which int(0) and float(0.0) both do.
 MANUAL_INTERVAL = 0.0
 INTERVAL_CHOICES = [MANUAL_INTERVAL, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
-TOP_CHOICES = [5, 10, 15, 20, 25, 50]
+# 0 is the "Max" sentinel — no row cap, show every process (same JSON
+# round-trip property as MANUAL_INTERVAL: int(0) compares equal after reload).
+MAX_TOP_SENTINEL = 0
+TOP_CHOICES = [5, 10, 15, 20, 25, 50, MAX_TOP_SENTINEL]
 # (internal key, display label) — internal key is what's persisted.
-SORT_CHOICES = [("forks", "Forks"), ("cpu", "CPU%")]
+SORT_CHOICES = [
+    ("forks", "Forks"),
+    ("cpu", "CPU%"),
+    ("name", "Name"),
+    ("tree", "Tree"),
+]
 DEFAULT_INTERVAL = 5.0
 DEFAULT_TOP = 15
 DEFAULT_SORT = "forks"
-MAX_TOP = max(TOP_CHOICES)  # upper bound on row count for the popover
 
 # Popover sizing — these are starting values for the architectural skeleton.
 # Phases 3/5 will likely tune these (the custom row views will be taller than
@@ -217,6 +214,11 @@ def interval_label(sec: float) -> str:
     """Display label for an interval choice — "Manual" for the 0.0 sentinel,
     "Ns" otherwise. Used as both the menu item title and the radio key."""
     return "Manual" if sec <= 0 else f"{sec:g}s"
+
+
+def top_label(n: int) -> str:
+    """Display label for a Top N choice — "Max" for the 0 sentinel."""
+    return "Max" if n <= 0 else str(n)
 
 
 def parse_pcpu(s: str) -> float:
@@ -448,21 +450,6 @@ def compute_rate(history: "deque[tuple[float, int]]", current_value: int, now: f
 _MONO_FONT = NSFont.monospacedSystemFontOfSize_weight_(13.0, 0)
 _MONO_ATTRS = {NSFontAttributeName: _MONO_FONT}
 
-
-def _mono_text_field(text: str) -> NSTextField:
-    """Construct a label-style NSTextField with monospaced font. Used for
-    both header and row placeholder views — Phase 3/4 will replace these
-    with real composite views that draw their own subcomponents."""
-    tf = NSTextField.alloc().init()
-    tf.setBezeled_(False)
-    tf.setDrawsBackground_(False)
-    tf.setEditable_(False)
-    tf.setSelectable_(False)
-    tf.setFont_(_MONO_FONT)
-    tf.setStringValue_(text)
-    return tf
-
-
 _BAR_FULL = "█"
 # Empty-cell glyph is plain space, not U+2591 LIGHT SHADE — light-shade
 # renders as a noisy gradient that competes with the filled blocks, and
@@ -479,8 +466,6 @@ def bar(value: int, max_value: int, width: int = 8) -> str:
     blocks like ▁▂▃ sit at the bottom of the cell and read as visual
     artifacts. A non-zero value always lights at least one cell so the
     smallest forkers stay visible."""
-    import math
-
     if max_value <= 0 or value <= 0:
         return _BAR_EMPTY * width
     frac = math.log10(value + 1) / math.log10(max_value + 1)
@@ -504,20 +489,42 @@ _pid_binary_cache: dict[int, str] = {}
 _FALLBACK_ICON_NAME = "gearshape.fill"
 
 
-def _resolve_binary_path(pid: int) -> str:
-    """Return the full executable path for `pid` via `ps -o comm= -p <pid>`.
-    Returns an empty string on any error — callers must handle the empty case."""
-    if pid in _pid_binary_cache:
-        return _pid_binary_cache[pid]
+def _refresh_binary_paths() -> None:
+    """Rebuild the PID → executable path map in ONE `ps -eo pid,comm` call.
+
+    Replaces the old per-PID `ps -o comm= -p <pid>` resolution: with the
+    "Max" Top N every process gets a row, and per-PID resolution would
+    spawn hundreds of subprocesses on the first tick — from the
+    fork-watching tool. Wholesale replacement also self-prunes dead PIDs
+    and keeps recycled PIDs from inheriting a stale path."""
+    global _pid_binary_cache
     try:
-        result = subprocess.run(
-            ["ps", "-o", "comm=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=2
-        )
-        path = result.stdout.strip()
+        out = subprocess.run(
+            ["ps", "-eo", "pid,comm"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
     except Exception:
-        path = ""
-    _pid_binary_cache[pid] = path
+        return  # keep the previous map — stale beats empty
+    fresh: dict[int, str] = {}
+    for i, line in enumerate(out.splitlines()):
+        if i == 0:
+            continue
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            fresh[int(parts[0])] = parts[1]
+    _pid_binary_cache = fresh
+
+
+def _resolve_binary_path(pid: int) -> str:
+    """Return the full executable path for `pid` from the batch-collected
+    map, refreshing it (one subprocess for ALL pids) on a miss. Returns an
+    empty string when the PID is gone — callers handle the empty case."""
+    path = _pid_binary_cache.get(pid)
+    if path is None:
+        _refresh_binary_paths()
+        # Negative-cache a miss so a PID that died mid-tick can't trigger
+        # a refresh per row update.
+        path = _pid_binary_cache.setdefault(pid, "")
     return path
 
 
@@ -566,20 +573,27 @@ def _severity_sf_symbol(severity: str) -> tuple[str, NSColor]:
     return "snowflake", NSColor.systemBlueColor()
 
 
+_severity_image_cache: dict[str, Optional[NSImage]] = {}
+
+
 def _make_severity_image(severity: str) -> Optional[NSImage]:
-    """Build a tinted SF Symbols image for the given severity."""
+    """Tinted SF Symbols image for the given severity — built once per
+    severity value and cached (NSImage instances are safe to share across
+    image views). Before caching, this rebuilt the image for every row on
+    every tick — 100+ image constructions/sec at the 0.25s interval."""
+    if severity in _severity_image_cache:
+        return _severity_image_cache[severity]
     name, color = _severity_sf_symbol(severity)
     img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
-    if img is None:
-        return None
-    # Apply a hierarchical rendering configuration with the target color.
-    try:
-        cfg = objc.lookUpClass("NSImageSymbolConfiguration")
-        hierarchical = cfg.configurationWithHierarchicalColor_(color)
-        return img.imageWithSymbolConfiguration_(hierarchical)
-    except Exception:
-        # Fallback: return un-tinted image if symbol configuration unavailable.
-        return img
+    if img is not None:
+        # Apply a hierarchical rendering configuration with the target color.
+        try:
+            cfg = NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color)
+            img = img.imageWithSymbolConfiguration_(cfg)
+        except Exception:
+            pass  # fall back to the un-tinted image
+    _severity_image_cache[severity] = img
+    return img
 
 
 def _heat_color(fraction: float) -> NSColor:
@@ -690,24 +704,16 @@ class HeatGaugeView(NSView):
         return self
 
     def setFraction_(self, fraction):  # noqa: N802
-        """Update the fill fraction with a short ease-out animation (Phase 5)."""
+        """Update the fill fraction and repaint. drawRect_-based views have
+        no animatable property for NSAnimationContext to interpolate — the
+        previous runAnimationGroup wrapper animated nothing and only deferred
+        the repaint to its completion handler, so the gauge lagged the data
+        by 0.25s on every tick. Direct setNeedsDisplay_ repaints this tick."""
         new_fraction = max(0.0, min(1.0, float(fraction)))
         if abs(new_fraction - self._fraction) < 0.001:
-            return  # skip animation for negligible changes
+            return  # skip repaint for negligible changes
         self._fraction = new_fraction
-        # Wrap the redraw in a 0.25s ease-out animation context so AppKit
-        # smooths any layer-backed transitions during the repaint.
-        def _do_draw():
-            self.setNeedsDisplay_(True)
-        try:
-            NSAnimationContext.runAnimationGroup_completionHandler_(
-                lambda ctx: (
-                    ctx.setDuration_(0.25),
-                ),
-                _do_draw,
-            )
-        except Exception:
-            self.setNeedsDisplay_(True)
+        self.setNeedsDisplay_(True)
 
     def drawRect_(self, dirty_rect):  # noqa: N802
         bounds = self.bounds()
@@ -903,10 +909,12 @@ class RichRowView(NSView):
         bar_max = bar_context["bar_max"]
         severity = pid_severity.get(pid, "cold")
 
-        # Update per-row identity for context menu.
+        # Update per-row identity for context menu. Tree sort indents the
+        # display name by depth — strip that for identity surfaces (kill
+        # confirmation dialog, logs); the name label keeps the indent.
         old_pid = self._pid
         self._pid = pid
-        self._name = name
+        self._name = name.lstrip()
 
         # 1. Severity glyph — rebuild if severity changed.
         sev_img = _make_severity_image(severity)
@@ -925,7 +933,6 @@ class RichRowView(NSView):
         self._spark_view.setSamples_severity_(list(hist), severity)
 
         # 5. Heat gauge — log-scaled fraction matching bar() logic.
-        import math
         bar_value = acc_cpu if (self._app is not None and self._app.sort_by == "cpu") else float(forks_n)
         if bar_max > 0 and bar_value > 0:
             fraction = math.log10(bar_value + 1) / math.log10(bar_max + 1)
@@ -1016,6 +1023,47 @@ def compute_accumulated_pcpu(procs: list[dict]) -> dict[int, float]:
     return acc
 
 
+def tree_order(
+    rows: list[tuple[int, int, int, str, str, str, float]],
+    ppid_of: dict[int, int],
+) -> list[tuple[int, int, int, str, str, str, float]]:
+    """Re-order snapshot rows into process-tree (descendancy) order — DFS
+    pre-order of the ppid tree, siblings by ascending PID — and indent each
+    name by its tree depth so the hierarchy reads at a glance.
+
+    PID 1 (launchd) is the ancestor of every user process but is filtered
+    from the popover's row list, so its direct children start at depth 0 —
+    otherwise every visible row would carry one dead indent level. Rows
+    whose parent isn't in the snapshot (parent died mid-collection) are
+    roots at depth 0. Iterative walk — deep trees can't blow the stack."""
+    by_pid = {r[2]: r for r in rows}
+    kids: dict[int, list[int]] = defaultdict(list)
+    roots: list[int] = []
+    for r in rows:
+        pid = r[2]
+        ppid = ppid_of.get(pid)
+        if ppid in by_pid and ppid != pid:
+            kids[ppid].append(pid)
+        else:
+            roots.append(pid)
+    for lst in kids.values():
+        lst.sort()
+    roots.sort()
+
+    ordered: list[tuple[int, int, int, str, str, str, float]] = []
+    stack = [(pid, 0) for pid in reversed(roots)]
+    while stack:
+        pid, depth = stack.pop()
+        forks_n, threads_n, _, pcpu, stat, name, acc_cpu = by_pid[pid]
+        if depth:
+            name = "  " * depth + name
+        ordered.append((forks_n, threads_n, pid, pcpu, stat, name, acc_cpu))
+        child_depth = 0 if pid == 1 else depth + 1
+        for child in reversed(kids.get(pid, ())):
+            stack.append((child, child_depth))
+    return ordered
+
+
 # --- settings persistence ---
 
 def load_settings() -> dict:
@@ -1085,14 +1133,16 @@ class _TickHandler(NSObject):
 # NSTextField / NSImageView subviews so Auto Layout handles positioning;
 # only the sparkline itself is custom-drawn.
 
-# Severity → NSColor mapping used by both the trend arrow and the
-# sparkline stroke.
+# Severity → color / SF Symbol name, used by the trend arrow and the
+# sparkline stroke. Both delegate to _severity_sf_symbol (Phase 3 helper)
+# so the severity → (symbol, color) mapping lives in exactly one place.
 def _severity_color(severity: str) -> "NSColor":
-    if severity == "hot":
-        return NSColor.systemRedColor()
-    if severity == "warm":
-        return NSColor.systemOrangeColor()
-    return NSColor.systemBlueColor()
+    return _severity_sf_symbol(severity)[1]
+
+
+def _severity_symbol(severity: str) -> str:
+    """SF Symbol name for the current severity state."""
+    return _severity_sf_symbol(severity)[0]
 
 
 def _trend_color(cpu_trend: str) -> "NSColor":
@@ -1101,15 +1151,6 @@ def _trend_color(cpu_trend: str) -> "NSColor":
     if cpu_trend == "falling":
         return NSColor.systemBlueColor()
     return NSColor.secondaryLabelColor()
-
-
-def _severity_symbol(severity: str) -> str:
-    """SF Symbol name for the current severity state."""
-    if severity == "hot":
-        return "flame.fill"
-    if severity == "warm":
-        return "thermometer.medium"
-    return "snowflake"
 
 
 def _make_label(text: str, font: "NSFont", color: "NSColor" = None) -> "NSTextField":
@@ -1664,7 +1705,7 @@ class WatchForksViewController(NSViewController):
         top_menu.setAutoenablesItems_(False)
         for n in TOP_CHOICES:
             it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"{n}", b"settingsTop:", ""
+                top_label(n), b"settingsTop:", ""
             )
             it.setTarget_(self)
             it.setRepresentedObject_(n)
@@ -2238,7 +2279,7 @@ class WatchForksApp(rumps.App):
             pid = row["pid"]
             out.append(
                 (
-                    forks[pid],
+                    forks.get(pid, 0),
                     threads.get(pid, 0),
                     pid,
                     row["pcpu"],
@@ -2249,6 +2290,10 @@ class WatchForksApp(rumps.App):
             )
         if self.sort_by == "cpu":
             out.sort(key=lambda r: (-r[6], -r[0], -r[1], r[2]))
+        elif self.sort_by == "name":
+            out.sort(key=lambda r: (r[5].casefold(), r[2]))
+        elif self.sort_by == "tree":
+            out = tree_order(out, {row["pid"]: row["ppid"] for row in procs})
         else:  # "forks" (default)
             out.sort(key=lambda r: (-r[0], -r[1], r[2]))
         return out
@@ -2301,6 +2346,14 @@ class WatchForksApp(rumps.App):
             if pid not in live_pids:
                 del self.pid_history[pid]
                 self.pid_severity.pop(pid, None)
+        # Prune the per-PID lookup caches too — unbounded growth over days
+        # of uptime, and a recycled PID must not inherit a dead process's
+        # cached icon/CWD. (_pid_binary_cache self-prunes — it's rebuilt
+        # wholesale by _refresh_binary_paths.)
+        for pid in list(_pid_icon_cache):
+            if pid not in live_pids:
+                del _pid_icon_cache[pid]
+        _wf.prune_pid_caches(live_pids)
 
     # ============================================================================
     # OVERRIDE POINTS — Phases 3 & 4 will replace these four methods.
@@ -2484,11 +2537,18 @@ class WatchForksApp(rumps.App):
         # scale (its forks/CPU dwarf every other process by orders of
         # magnitude) and duplicate information.
         display_snap = [r for r in snap if r[2] != 1]
-        top_n = min(self.top, len(display_snap))
-        if self.sort_by == "cpu":
-            bar_max = display_snap[0][6] if display_snap else 0.0
+        # Top N sentinel 0 = "Max": no cap, every process gets a row.
+        if self.top <= 0:
+            top_n = len(display_snap)
         else:
-            bar_max = float(display_snap[0][0]) if display_snap else 0.0
+            top_n = min(self.top, len(display_snap))
+        # Gauge scale = max over the VISIBLE rows for the active bar
+        # dimension. For forks/cpu sorts that's just row 0, but name/tree
+        # sorts don't put the max first.
+        if self.sort_by == "cpu":
+            bar_max = max((r[6] for r in display_snap[:top_n]), default=0.0)
+        else:
+            bar_max = max((float(r[0]) for r in display_snap[:top_n]), default=0.0)
         name_width = max((len(r[5]) for r in display_snap[:top_n]), default=16)
         name_width = min(max(name_width, 16), 28)
         self._bar_context = {"bar_max": bar_max, "name_width": name_width}

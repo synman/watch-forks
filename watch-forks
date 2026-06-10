@@ -74,6 +74,9 @@ VERSION_UCOMM = re.compile(r"^[0-9]+\.[0-9]+")
 CLAUDE_NAME_ARG = re.compile(r"--name\s+(\S+)")
 COPILOT_BIN = re.compile(r"(?:^|/)copilot$")
 GENERIC_BASENAMES = {"server", "main", "__main__", "index", "cli"}
+# Binaries whose bare single-token COMMAND must NOT short-circuit step 0 —
+# they carry no --name and need CWD-based scope resolution in step 5.
+CWD_RESOLVED_BINS = {"copilot", "crush", "opencode", "bun"}
 
 # CWD-to-scope resolution for processes that don't carry --name (e.g. copilot).
 # Reads .workspace-paths once per render cycle; maps absolute CWD → key.
@@ -85,10 +88,14 @@ def _load_workspace_paths() -> dict[str, str]:
     global _WP_CACHE, _WP_MTIME
     wp = os.path.expanduser("~/.workspace-paths")
     if not os.path.isfile(wp):
-        isaac = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             os.pardir, "claude-isaac", ".workspace-paths")
-        if os.path.isfile(isaac):
-            wp = isaac
+        # Fall back to the registry inside a sibling isaac clone — the
+        # clone dir is `claude-isaac` on some machines and `isaac` on others.
+        parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for sibling in ("claude-isaac", "isaac"):
+            cand = os.path.join(parent, sibling, ".workspace-paths")
+            if os.path.isfile(cand):
+                wp = cand
+                break
         else:
             return _WP_CACHE or {}
     try:
@@ -153,6 +160,15 @@ def _resolve_cwd(pid: int) -> str:
         pass
     _cwd_cache[pid] = ""
     return ""
+
+
+def prune_pid_caches(live_pids: set[int]) -> None:
+    """Drop cached CWDs for PIDs that are no longer alive. Keeps the cache
+    bounded in long-running consumers (the menubar widget runs for days) and
+    prevents a recycled PID from inheriting a dead process's cached CWD."""
+    for pid in list(_cwd_cache):
+        if pid not in live_pids:
+            del _cwd_cache[pid]
 
 
 def _run(cmd: list[str]) -> str:
@@ -238,9 +254,8 @@ def shortname(cmd: str, uc: str, pid: int = 0) -> str:
     # 0. Single-token COMMAND with no path separator = setproctitle rewrite
     #    (e.g. nginx-worker). Honor it before any path/python parsing.
     #    Skip for binaries that need CWD-based scope resolution (step 5).
-    _CWD_RESOLVED = {"copilot", "crush", "opencode", "bun"}
     if cmd and " " not in cmd and "/" not in cmd:
-        if cmd not in _CWD_RESOLVED:
+        if cmd not in CWD_RESOLVED_BINS:
             return cmd
     # 1. Python interpreter at start of COMMAND
     m = PY_INTERP.match(cmd)
@@ -316,6 +331,7 @@ def render(top: int) -> None:
     threads = collect_threads()
     ucomm = collect_ucomm()
     procs = collect_procs()
+    prune_pid_caches({row["pid"] for row in procs})
     tmux_suffix = ""
     sessions = collect_tmux_sessions()
     if sessions:
@@ -329,7 +345,7 @@ def render(top: int) -> None:
         if name == "tmux" and tmux_suffix:
             name = "tmux" + tmux_suffix
         rows.append((
-            forks[row["pid"]],
+            forks.get(row["pid"], 0),
             threads.get(row["pid"], 0),
             row["pid"],
             row["pcpu"],
@@ -337,10 +353,16 @@ def render(top: int) -> None:
             name,
         ))
     rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
-    print(CLEAR, end="")
-    print(f'{HDR}{"FORKS":<10} | {"THREADS":<10} | {"PID":<10} | {"CPU%":<6} | {"STAT":<5} | NAME{RESET}')
+    # Build the whole frame and emit it in ONE write — per-line print()s
+    # let the terminal repaint a half-drawn frame (visible flicker at
+    # sub-second intervals).
+    lines = [
+        f'{HDR}{"FORKS":<10} | {"THREADS":<10} | {"PID":<10} | {"CPU%":<6} | {"STAT":<5} | NAME{RESET}'
+    ]
     for forks_n, threads_n, pid, pcpu, stat, name in rows[:top]:
-        print(f"{forks_n:<10} | {threads_n:<10} | {pid:<10} | {pcpu:<6} | {stat:<5} | {name}")
+        lines.append(f"{forks_n:<10} | {threads_n:<10} | {pid:<10} | {pcpu:<6} | {stat:<5} | {name}")
+    sys.stdout.write(CLEAR + "\n".join(lines) + "\n")
+    sys.stdout.flush()
 
 
 def main() -> int:
