@@ -317,12 +317,23 @@ def shortname(cmd: str, uc: str, pid: int = 0) -> str:
         m3 = CLAUDE_NAME_ARG.search(cmd)
         if m3:
             return m3.group(1)
-    # 5. Copilot / Crush / OpenCode / bun(OpenCode) have no --name; resolve CWD → scope
+    # 5. Copilot / Crush / OpenCode / bun(OpenCode) have no --name; resolve scope
     if name in ("copilot", "crush", "opencode", "opencode.exe", "bun") and pid:
+        prefix = "oc" if name in ("opencode", "opencode.exe", "bun") else name
+        # 5a. bun: parse COMMAND for --agent (explicit identity) or trailing
+        #     positional path after src/index.ts (the real workspace dir).
+        if name == "bun":
+            m_agent = re.search(r"--agent\s+(\S+)", cmd)
+            if m_agent:
+                return m_agent.group(1)
+            m_path = re.search(r"src/index\.ts\s+(/\S+)", cmd)
+            if m_path:
+                scope = _cwd_to_scope(m_path.group(1))
+                return f"{prefix}-{scope}"
+        # 5b. Generic CWD fallback (copilot/crush/opencode)
         cwd = _resolve_cwd(pid)
         if cwd:
             scope = _cwd_to_scope(cwd)
-            prefix = "oc" if name in ("opencode", "opencode.exe", "bun") else name
             return f"{prefix}-{scope}"
     return name
 
