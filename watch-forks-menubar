@@ -72,6 +72,7 @@ from AppKit import (
     NSFont,
     NSFontAttributeName,
     NSFontWeightMedium,
+    NSFontWeightRegular,
     NSFontWeightSemibold,
     NSForegroundColorAttributeName,
     NSGraphicsContext,
@@ -204,17 +205,22 @@ DEFAULT_SORT = "forks"
 POPOVER_WIDTH = 460.0
 POPOVER_ROW_AREA_HEIGHT = 640.0  # scroll view height cap — ~26 rows @ 24pt each
 # Status item width — sized to the WIDEST title the current digit counts can
-# produce (the button font's widest digit in every digit slot, the widest
-# trend arrow) plus the button's horizontal insets. Title content varies in
-# pixel width per tick ("4" wider than "1", arrow swaps direction), and a
-# variable-length item would drag the popover anchor with every reflow; the
-# template only changes when a digit COUNT changes (999 → 1000 procs,
-# 99% → 100%), so the anchor stays put between ticks exactly as a fixed
-# width did. The previous fixed 175pt reserved room for "❄️ 1234 / 999% ↑"
-# permanently — ~70pt of gutter on a notched MacBook whose whole
-# right-of-notch budget is ~770pt, enough to push a neighbour behind the
-# notch.
-STATUS_ITEM_PADDING = 12.0
+# produce plus the button's own horizontal insets, nothing more. The title is
+# rendered with monospaced digits so every digit slot is one width, and the
+# template reserves the widest trend arrow; the width therefore changes only
+# when a digit COUNT changes (999 → 1000 procs, 99% → 100%) or the severity
+# emoji changes, so the popover anchor stays put between ticks exactly as a
+# fixed width did — without the gutter. The previous fixed 175pt reserved
+# room for "❄️ 1234 / 999% ↑" permanently: ~70pt of gutter on a notched
+# MacBook whose whole right-of-notch budget is ~770pt, enough to push a
+# neighbour behind the notch.
+# Extra points beyond the template's measured advance width. ControlCenter
+# hosts every status item in its own window with ~8pt of spacing a side
+# (measured 2026-09-13 from the host windows' alpha: an icon-only item sits
+# at 8/8, a stock variable-length rumps title at ~11/11), so the item needs
+# no padding of its own; the widest-arrow reservation already leaves a
+# couple of points when a narrower arrow is showing.
+STATUS_ITEM_PADDING = 0.0
 
 
 def interval_label(sec: float) -> str:
@@ -2086,10 +2092,35 @@ class WatchForksApp(rumps.App):
             return
         btn.setTarget_(self._status_click_target)
         btn.setAction_(b"togglePopover:")
-        # Width is pinned by _fit_status_item_length once _tick has a title —
-        # see STATUS_ITEM_PADDING for why it is a template, not a constant.
+        # Monospaced digits so a digit change never changes the rendered
+        # width — set on the button, not per title (an explicit attributed
+        # title is laid out flush-left and ignores paragraph alignment; so
+        # does the button's own alignment once a fixed length is set —
+        # both measured 2026-09-13, neither moved the ink). Width is pinned
+        # by _fit_status_item_length once _tick has a title — see
+        # STATUS_ITEM_PADDING for why it is a template, not a constant.
+        btn.setFont_(self._status_title_font(btn))
         self._status_bound = True
         log.info("status item bound to togglePopover")
+
+    def _status_button(self):
+        """The NSStatusBarButton rumps created, or None before it exists."""
+        nsapp = getattr(self, "_nsapp", None)
+        item = getattr(nsapp, "nsstatusitem", None) if nsapp is not None else None
+        return item.button() if item is not None and hasattr(item, "button") else None
+
+    def _status_title_font(self, btn):
+        """Menu-bar title font with monospaced digits — the face and size
+        AppKit gave the status button, so a digit change never changes the
+        rendered width. Built once and cached."""
+        font = getattr(self, "_status_font", None)
+        if font is None:
+            base = btn.font() or NSFont.menuBarFontOfSize_(0)
+            font = NSFont.monospacedDigitSystemFontOfSize_weight_(
+                base.pointSize(), NSFontWeightRegular
+            )
+            self._status_font = font
+        return font
 
     def _fit_status_item_length(self, emoji: str, procs_digits: int, cpu_digits: int) -> None:
         """Pin the status item to the widest title its current digit counts
@@ -2098,18 +2129,17 @@ class WatchForksApp(rumps.App):
 
         Keyed on (emoji, proc digits, cpu digits): setLength_ only runs when
         one of those changes, which is rare (a digit-count rollover or a
-        severity change). Widest digit and widest arrow are measured in the
-        button's own font rather than assumed."""
+        severity change). The template is measured in the same
+        monospaced-digit font the title is drawn with, so the only slack it
+        can carry is the width difference between trend arrows."""
         key = (emoji, procs_digits, cpu_digits)
         if key == getattr(self, "_status_length_key", None):
             return
-        nsapp = getattr(self, "_nsapp", None)
-        item = getattr(nsapp, "nsstatusitem", None) if nsapp is not None else None
-        btn = item.button() if item is not None and hasattr(item, "button") else None
+        btn = self._status_button()
         if btn is None:
             return
-        font = btn.font() or NSFont.menuBarFontOfSize_(0)
-        attrs = {NSFontAttributeName: font}
+        item = self._nsapp.nsstatusitem
+        attrs = {NSFontAttributeName: self._status_title_font(btn)}
 
         def width(text: str) -> float:
             return NSAttributedString.alloc().initWithString_attributes_(text, attrs).size().width
