@@ -32,7 +32,7 @@ A first-class status-bar app built on `NSPopover` + a custom `NSViewController`.
 
 #### Menu bar title
 
-`❄️ 1234 / 567% ↑` — severity emoji · total procs · total CPU% · trend arrow. The status item is pinned to a fixed width so it doesn't reflow as the digits change.
+`❄️ 1234 / 567% ↑` — severity emoji · total procs · total CPU% · trend arrow. The status item is pinned to the widest title its current digit counts can produce, so it doesn't reflow as the digits or the arrow change — and carries no fixed gutter.
 
 - **Rate-based severity** with hysteresis (❄️ cold / 🌡️ warm / 🔥 hot) — driven by the process-count rate of change over a 5-minute rolling window; `hot` can only fall to `warm`, never directly to `cold`.
 - **CPU trend indicator** (↑ ↓ →) with asymmetric hysteresis — enters rising/falling on a 15% sample-to-sample delta, exits only on an 8% opposite-direction reversal, so noise doesn't flap the icon.
@@ -179,7 +179,7 @@ A few details worth flagging if you're reading the source:
 
 - **`NSPopover` + custom `NSViewController`** is the architectural backbone. `NSMenu` would constrain rows to text-only items inside the system's menu font — `NSPopover` hosts a hand-rolled view hierarchy where every row is a custom composite `NSView` with full graphics primitives, animation, and per-row hover state. The status item still uses `NSStatusItem` (rumps gives us this); clicking it toggles the popover via `togglePopover_`.
 
-- **Fixed `NSStatusItem` width** (`setLength_(175.0)`) — without this, the menu bar button reflows by 1–2 pixels every time digits or the trend arrow change in the title. `NSPopover` anchors to the button, so any shift dragged the entire popover left or right per refresh — visible as a horizontal "shutter." Pinning the width holds the anchor stable.
+- **Stable-width `NSStatusItem`** (`_fit_status_item_length`) — with the default variable length, the menu bar button reflows by 1–2 pixels every time digits or the trend arrow change in the title. `NSPopover` anchors to the button, so any shift dragged the entire popover left or right per refresh — visible as a horizontal "shutter." The width is pinned to a widest-case template for the current digit counts (the button font's widest digit in every slot, the widest arrow, plus insets), re-fit only when a digit count or the severity emoji changes. Same anchor stability as the earlier fixed `setLength_(175.0)`, ~70pt narrower — on a notched MacBook the entire right-of-notch budget is ~770pt, and a fixed gutter that size is enough to push a neighbouring status item behind the notch, where macOS silently stops painting it.
 
 - **`NSTimer` in `NSRunLoopCommonModes`** for the popover refresh. `NSRunLoopDefaultMode` is suspended while menu tracking is active; common modes cover both default and `NSEventTrackingRunLoopMode`, so the tick keeps firing whether the popover is open or closed. Implementation drops out of rumps's `Timer` to a raw `NSTimer` with a small `NSObject` subclass as target.
 

@@ -203,11 +203,18 @@ DEFAULT_SORT = "forks"
 # sparklines/gauges).
 POPOVER_WIDTH = 460.0
 POPOVER_ROW_AREA_HEIGHT = 640.0  # scroll view height cap — ~26 rows @ 24pt each
-# Fixed status item width — title content varies in pixel width per tick
-# ("4" wider than "1", arrow swaps direction, %CPU swings between 3 and 4
-# digits). Variable-length status item would resize the button per tick,
-# dragging the popover anchor with it. 175pt fits "❄️ 1234 / 999% ↑".
-STATUS_ITEM_LENGTH = 175.0
+# Status item width — sized to the WIDEST title the current digit counts can
+# produce (the button font's widest digit in every digit slot, the widest
+# trend arrow) plus the button's horizontal insets. Title content varies in
+# pixel width per tick ("4" wider than "1", arrow swaps direction), and a
+# variable-length item would drag the popover anchor with every reflow; the
+# template only changes when a digit COUNT changes (999 → 1000 procs,
+# 99% → 100%), so the anchor stays put between ticks exactly as a fixed
+# width did. The previous fixed 175pt reserved room for "❄️ 1234 / 999% ↑"
+# permanently — ~70pt of gutter on a notched MacBook whose whole
+# right-of-notch budget is ~770pt, enough to push a neighbour behind the
+# notch.
+STATUS_ITEM_PADDING = 12.0
 
 
 def interval_label(sec: float) -> str:
@@ -2079,15 +2086,41 @@ class WatchForksApp(rumps.App):
             return
         btn.setTarget_(self._status_click_target)
         btn.setAction_(b"togglePopover:")
-        # Pin the status item to a fixed width. Default is NSVariableStatusItemLength
-        # (-1) which sizes to the title's current width — and since our title
-        # ("❄️ 973 / 178% ↑") shifts by 1-2 pixels as digits change ("4" wider than
-        # "1", arrow swaps direction, etc.), the status button reflows every tick.
-        # NSPopover anchors to that button and follows the shift → entire popover
-        # shudders left/right per refresh. Fixed length kills the anchor jitter.
-        item.setLength_(STATUS_ITEM_LENGTH)
+        # Width is pinned by _fit_status_item_length once _tick has a title —
+        # see STATUS_ITEM_PADDING for why it is a template, not a constant.
         self._status_bound = True
-        log.info("status item bound to togglePopover (length=%.0fpt)", STATUS_ITEM_LENGTH)
+        log.info("status item bound to togglePopover")
+
+    def _fit_status_item_length(self, emoji: str, procs_digits: int, cpu_digits: int) -> None:
+        """Pin the status item to the widest title its current digit counts
+        can produce, so the width is stable between ticks (no popover-anchor
+        jitter) but carries no fixed gutter.
+
+        Keyed on (emoji, proc digits, cpu digits): setLength_ only runs when
+        one of those changes, which is rare (a digit-count rollover or a
+        severity change). Widest digit and widest arrow are measured in the
+        button's own font rather than assumed."""
+        key = (emoji, procs_digits, cpu_digits)
+        if key == getattr(self, "_status_length_key", None):
+            return
+        nsapp = getattr(self, "_nsapp", None)
+        item = getattr(nsapp, "nsstatusitem", None) if nsapp is not None else None
+        btn = item.button() if item is not None and hasattr(item, "button") else None
+        if btn is None:
+            return
+        font = btn.font() or NSFont.menuBarFontOfSize_(0)
+        attrs = {NSFontAttributeName: font}
+
+        def width(text: str) -> float:
+            return NSAttributedString.alloc().initWithString_attributes_(text, attrs).size().width
+
+        digit = max("0123456789", key=width)
+        arrow = max(TREND_BY_STATE.values(), key=width)
+        template = f"{emoji} {digit * procs_digits} / {digit * cpu_digits}% {arrow}"
+        length = math.ceil(width(template) + STATUS_ITEM_PADDING)
+        item.setLength_(length)
+        self._status_length_key = key
+        log.info("status item length → %dpt (template %r)", length, template)
 
     # ----- light/dark mode observer (Phase 5) -----
 
@@ -2508,7 +2541,10 @@ class WatchForksApp(rumps.App):
             )
         self.last_total_cpu = total_cpu
         trend_glyph = TREND_BY_STATE[self.cpu_trend]
-        self.title = f"{emoji} {total_procs} / {total_cpu:.0f}% {trend_glyph}"
+        procs_text = str(total_procs)
+        cpu_text = f"{total_cpu:.0f}"
+        self.title = f"{emoji} {procs_text} / {cpu_text}% {trend_glyph}"
+        self._fit_status_item_length(emoji, len(procs_text), len(cpu_text))
 
         # If the popover hasn't been built yet, the menubar title is the
         # only visible surface — bail before touching view hierarchies.
