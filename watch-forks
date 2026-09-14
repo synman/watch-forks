@@ -19,8 +19,9 @@ NAME column extraction order:
                                                 (handles "Microsoft Teams" etc.;
                                                  Darwin kernel caps at 16 chars)
   4.  Post-process: claude CLI w/ `--name claude-<scope>` → that scope
-  5.  Post-process: copilot/crush/opencode CLI → resolve CWD via lsof
-                    → map to .workspace-paths key → `<binary>-<scope>`
+  5.  Post-process: claude (bg-spare daemon, no --name)/copilot/crush/opencode
+                    CLI → resolve CWD via lsof → map to .workspace-paths key
+                    → `<binary>-<scope>`
 
 macOS-only — uses BSD-style `ps -eM` for per-thread output (no Linux equivalent).
 """
@@ -76,7 +77,7 @@ COPILOT_BIN = re.compile(r"(?:^|/)copilot$")
 GENERIC_BASENAMES = {"server", "main", "__main__", "index", "cli"}
 # Binaries whose bare single-token COMMAND must NOT short-circuit step 0 —
 # they carry no --name and need CWD-based scope resolution in step 5.
-CWD_RESOLVED_BINS = {"copilot", "crush", "opencode", "bun"}
+CWD_RESOLVED_BINS = {"claude", "copilot", "crush", "opencode", "bun"}
 
 # CWD-to-scope resolution for processes that don't carry --name (e.g. copilot).
 # Reads .workspace-paths once per render cycle; maps absolute CWD → key.
@@ -312,13 +313,16 @@ def shortname(cmd: str, uc: str, pid: int = 0) -> str:
     else:
         # 3. Trust ucomm
         name = uc
-    # 4. Post-process: claude CLI carries `--name claude-<scope>` — surface that
+    # 4. Post-process: claude CLI carries `--name claude-<scope>` — surface that.
+    #    A daemon-spawned "bg-spare" claude process (claimed via IPC socket,
+    #    not argv rewrite) never gets a --name — falls through to step 5.
     if name == "claude":
         m3 = CLAUDE_NAME_ARG.search(cmd)
         if m3:
             return m3.group(1)
-    # 5. Copilot / Crush / OpenCode / bun(OpenCode) have no --name; resolve scope
-    if name in ("copilot", "crush", "opencode", "opencode.exe", "bun") and pid:
+    # 5. Copilot / Crush / OpenCode / bun(OpenCode) / nameless claude bg-spare
+    #    have no --name; resolve scope from CWD instead.
+    if name in ("claude", "copilot", "crush", "opencode", "opencode.exe", "bun") and pid:
         prefix = "oc" if name in ("opencode", "opencode.exe", "bun") else name
         # 5a. bun: parse COMMAND for --agent (explicit identity) or trailing
         #     positional path after src/index.ts (the real workspace dir).
